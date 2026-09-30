@@ -314,6 +314,90 @@ async def handle_health(request: Request):
         "model_loaded": asr_model is not None
     })
 
+@app.route("/transcribe", methods=["POST"])
+async def handle_transcribe(request: Request):
+    """
+    HTTP REST 一次性音訊轉寫端點 (支援 WAV, MP3, FLAC, M4A, OGG 等)
+    供外部 App、腳本、自動化流程直接上傳音訊檔案獲取辨識結果。
+    """
+    if asr_model is None:
+        return response.json({"status": "error", "message": "Model not loaded"}, status=503)
+
+    file = request.files.get("file")
+    if not file:
+        return response.json({"status": "error", "message": "Missing 'file' field in multipart/form-data"}, status=400)
+
+    language = request.form.get("language", None)
+    context = request.form.get("context", "")
+
+    try:
+        import io
+        import soundfile as sf
+        import librosa
+
+        audio_bytes = io.BytesIO(file.body)
+        try:
+            wav, sr = sf.read(audio_bytes)
+        except Exception:
+            audio_bytes.seek(0)
+            wav, sr = librosa.load(audio_bytes, sr=None, mono=True)
+
+        if wav.ndim > 1:
+            wav = np.mean(wav, axis=1)
+        if sr != 16000:
+            wav = librosa.resample(wav.astype(np.float32), orig_sr=sr, target_sr=16000)
+        else:
+            wav = wav.astype(np.float32)
+
+        duration_sec = round(len(wav) / 16000.0, 2)
+
+        def run_infer():
+            t0 = time.time()
+            step_samples = 2560
+            lookahead_samples = 2560
+            lang_param = None
+            if language:
+                if language.lower() in ("chinese", "zh", "zhen"):
+                    lang_param = "Chinese"
+                elif language.lower() in ("english", "en"):
+                    lang_param = "English"
+
+            state = asr_model.init_streaming_state(
+                context=context or "",
+                language=lang_param,
+                unfixed_chunk_num=0,
+                unfixed_token_num=UNFIX_TOKEN_NUM,
+                chunk_size_sec=0.32,
+            )
+            pos = 0
+            is_first = True
+            max_tokens = 4
+            while pos < len(wav):
+                if is_first:
+                    seg = wav[pos : pos + step_samples + lookahead_samples]
+                    is_first = False
+                else:
+                    seg = wav[pos : pos + step_samples]
+                pos += len(seg)
+                if len(seg) > 0:
+                    asr_model.streaming_transcribe(seg, state, max_tokens)
+            asr_model.finish_streaming_transcribe(state, max_tokens)
+            text = state.text.split("|")[0].strip()
+            cost_ms = round((time.time() - t0) * 1000, 1)
+            return text, cost_ms
+
+        text, cost_ms = await asyncio.to_thread(run_infer)
+        return response.json({
+            "status": "success",
+            "text": text,
+            "duration_sec": duration_sec,
+            "cost_ms": cost_ms,
+        })
+    except Exception as e:
+        logger.exception(f"Transcribe error: {e}")
+        return response.json({"status": "error", "message": str(e)}, status=500)
+
+
 # Streaming WebSocket v1
 @app.websocket("/asr_stream_api_v1")
 async def asr_stream_api_v1(request: Request, ws: Websocket):

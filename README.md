@@ -6,6 +6,37 @@
 
 ---
 
+## 🌐 線上運行實例與外部存取
+
+#### 1. 外部存取網址
+- **網頁字幕操作介面**：[https://147.5gao.ai/](https://147.5gao.ai/)
+- **內網直接存取**：`http://10.9.0.35:8040/`
+- **健康檢查端點**：`https://147.5gao.ai/health`
+  ```json
+  {
+    "status": "healthy",
+    "service": "Confucius4-R2T2",
+    "active_connections": 0,
+    "gpu_mem_util": "0.40",
+    "model_loaded": true
+  }
+  ```
+
+#### 2. 即時字幕網頁介面特色
+- **Web Audio 串流收音**：前端透過標準 `AudioContext` 自動降取樣至 16kHz 16-bit Mono PCM，以 160ms 緩衝區切片封裝發送。
+- **雙向 WebSocket (WSS)**：自動偵測 https 協定升級為 `wss://147.5gao.ai/asr_stream_api_v1`，全鏈路加密且具備重連機制。
+- **即時字幕卡片與波形**：整合即時麥克風音量波形動態視覺化、字元漸進式增量辨識、重複字過濾。
+- **OBS 直播推流覆蓋模式**：支援一鍵切換純黑/去背高對比字卡模式，方便串接直播或螢幕擷取。
+- **熱詞與語言設定**：支援中文/英文切換，可自訂業務熱詞（Hotwords）提升專有名詞準確率。
+- **預設授權金鑰**：`test0102`（網頁已自動填入）。
+
+#### 3. 系統服務常駐狀態
+- **Systemd 服務名稱**：`confucius4-r2t2.service`（已設置為開機自啟）
+- **服務目錄**：`/home/david/r2t2-service/`
+- **GPU 資源隔離**：配置 `gpu_memory_utilization=0.40`（佔用約 6.8 GB VRAM），與主機上原本運行的 IndexTTS (5.7GB) 及 CosyVoice3 (5.3GB) 完美共存，無任何顯存衝突或 OOM。
+
+---
+
 ## 🌟 核心特色
 
 1. **整合式現代即時字幕 Web UI**（`web/index.html`）：
@@ -103,51 +134,210 @@ docker compose logs -f r2t2-api
 
 ---
 
-## 📡 API 與 WebSocket 介面說明
+## 📡 外部 App 調用 API 指南 (External Application Integration)
 
-### 1. 健康檢查 (`GET /healthz` 或 `GET /health`)
+外部應用程式（如 Python 腳本、Node.js 服務、iOS/Android App、桌面軟體、自製網頁）可依據需求選擇以下兩種方式調用本 ASR 服務：
+
+---
+
+### 模式一：HTTP REST 音訊檔案轉寫 API（適合錄音檔/一次性辨識）
+
+上傳已錄製之音訊檔案（支援 WAV、MP3、FLAC、M4A、OGG 等格式），直接回傳完整識別結果。
+
+- **端點 URL**：`https://147.5gao.ai/transcribe`（或內網 `http://10.9.0.35:8040/transcribe`）
+- **HTTP 方法**：`POST`
+- **Content-Type**：`multipart/form-data`
+- **參數**：
+  - `file` (必填)：音訊二進制檔案
+  - `language` (選填)：`zhen`（中英混合）、`Chinese`（中文）、`English`（英文）
+  - `context` (選填)：自訂提示詞或上下文熱詞
+
+#### 1. cURL 呼叫範例
 ```bash
-curl http://localhost:8803/healthz
+curl -X POST https://147.5gao.ai/transcribe \
+  -F "file=@your_audio.wav" \
+  -F "language=zhen"
+```
+
+響應範例 (JSON)：
+```json
+{
+  "status": "success",
+  "text": "之前有顾客自己带酒水也没加收钱或者不让喝",
+  "duration_sec": 6.74,
+  "cost_ms": 3773.3
+}
+```
+
+#### 2. Python (requests) 呼叫範例
+```python
+import requests
+
+url = "https://147.5gao.ai/transcribe"
+files = {"file": open("sample.wav", "rb")}
+data = {"language": "zhen"}
+
+response = requests.post(url, files=files, data=data)
+print(response.json())
+# {"status": "success", "text": "...", "duration_sec": 6.74, "cost_ms": 3773.3}
+```
+
+---
+
+### 模式二：WebSocket 即時真流式語音辨識 API（推薦！極致低延遲）
+
+外部 App 透過 WebSocket 建立長連線，持續送入麥克風或音訊切片（16kHz 16-bit Mono PCM，每 160ms 一個 Chunk），服務端即時（~30ms）回傳確認的文字增量（Delta），並透過 VAD 自動換句。
+
+- **WebSocket URL**：`wss://147.5gao.ai/asr_stream_api_v1`（內網：`ws://10.9.0.35:8040/asr_stream_api_v1`）
+- **音訊格式**：16kHz, 16-bit, Mono PCM raw binary（每切片 160ms = 2,560 samples = 5,120 bytes）
+- **授權金鑰**：`test0102`
+
+#### 通訊流程：
+1. **建立 WebSocket 連線**。
+2. **傳送 Handshake JSON**：
+   ```json
+   {
+     "requestId": "488fbe6c-8fe8-442a-a925-fb355a153406",
+     "language": "zhen",
+     "use_vad": true,
+     "secret_key": "test0102"
+   }
+   ```
+3. **持續發送 PCM 二進制 Chunk**：每 160ms 傳送 5,120 bytes 的二進制數據。
+4. **即時接收服務端 JSON 響應**：
+   ```json
+   {
+     "status": "success",
+     "requestId": "488fbe6c-8fe8-442a-a925-fb355a153406",
+     "msg": {
+       "text": "即時辨識新增字詞",
+       "reset": false,
+       "asr_cost_ms": 32.5,
+       "total_cost_ms": 35.1
+     }
+   }
+   ```
+   > 說明：
+   > - `msg.text`：本次 Chunk **新增之確認文字（增量 Delta）**，靜音時為空字串，前端直接累加即可。
+   > - `msg.reset`：當說話人停頓（約 700ms）時觸發 VAD 斷句，回傳 `true`，代表當前句子結束，客戶端可進行換行存檔並重置當前句暫存。
+5. **結束傳輸**：發送結束字串 `"youdao_onetime_asr_eos_string"` 或主動關閉連線。
+
+#### 1. Python 完整即時串流呼叫腳本
+專案已提供可直接執行的示範腳本：[`examples/client_stream_demo.py`](./examples/client_stream_demo.py)
+```bash
+# 安裝依賴
+pip install websockets
+
+# 串流傳送音訊檔並即時印出逐字字幕
+python examples/client_stream_demo.py --audio test.wav --url wss://147.5gao.ai/asr_stream_api_v1
+```
+
+核心實作代碼片段：
+```python
+import asyncio
+import json
+import uuid
+import websockets
+
+async def run_asr_stream():
+    url = "wss://147.5gao.ai/asr_stream_api_v1"
+    async with websockets.connect(url) as ws:
+        # 1. 握手
+        await ws.send(json.dumps({
+            "requestId": str(uuid.uuid4()),
+            "language": "zhen",
+            "use_vad": True,
+            "secret_key": "test0102"
+        }))
+
+        # 2. 接收即時文字協程
+        async def on_receive():
+            full_sentence = ""
+            async for msg in ws:
+                data = json.loads(msg)
+                msg_body = data.get("msg", {})
+                delta = msg_body.get("text", "")
+                if delta:
+                    full_sentence += delta
+                    print(f"\r[即時字幕]: {full_sentence}", end="", flush=True)
+                if msg_body.get("reset"):
+                    print(f"\n[句結歸檔]: {full_sentence}")
+                    full_sentence = ""
+
+        recv_task = asyncio.create_task(on_receive())
+
+        # 3. 串流送入 PCM 音訊 (每 160ms 送 5120 bytes)
+        with open("sample_16k.pcm", "rb") as f:
+            while chunk := f.read(5120):
+                await ws.send(chunk)
+                await asyncio.sleep(0.16)
+
+        await ws.send("youdao_onetime_asr_eos_string")
+        await asyncio.sleep(1.0)
+        recv_task.cancel()
+
+asyncio.run(run_asr_stream())
+```
+
+#### 2. Node.js (ws) 呼叫範例
+```javascript
+import WebSocket from 'ws';
+import fs from 'fs';
+
+const ws = new WebSocket('wss://147.5gao.ai/asr_stream_api_v1');
+
+ws.on('open', () => {
+  // 1. 握手
+  ws.send(JSON.stringify({
+    requestId: 'app-client-' + Date.now(),
+    language: 'zhen',
+    use_vad: true,
+    secret_key: 'test0102'
+  }));
+
+  // 2. 串流發送 PCM 音訊
+  const stream = fs.createReadStream('audio.pcm', { highWaterMark: 5120 });
+  stream.on('data', (chunk) => {
+    ws.send(chunk);
+  });
+  stream.on('end', () => {
+    ws.send('youdao_onetime_asr_eos_string');
+  });
+});
+
+let currentSentence = '';
+ws.on('message', (data) => {
+  const res = JSON.parse(data.toString());
+  if (res.msg) {
+    if (res.msg.text) {
+      currentSentence += res.msg.text;
+      process.stdout.write(`\r[字幕] ${currentSentence}`);
+    }
+    if (res.msg.reset) {
+      console.log(`\n[完成] ${currentSentence}`);
+      currentSentence = '';
+    }
+  }
+});
+```
+
+---
+
+### 模式三：服務健康檢查 API (`GET /health`)
+
+```bash
+curl https://147.5gao.ai/health
 ```
 響應：
 ```json
 {
-  "status": "ok",
-  "backend": "vllm",
-  "model_loaded": true,
-  "arch": "x86_64",
-  "gpu": "NVIDIA RTX 4000 Ada Generation",
-  "vram_used_gb": 6.8,
-  "error": null
+  "status": "healthy",
+  "service": "Confucius4-R2T2",
+  "active_connections": 0,
+  "gpu_mem_util": "0.40",
+  "model_loaded": true
 }
 ```
-
-### 2. 即時語音 WebSocket 串流 (`WS /asr_stream_api_v1`)
-- **握手訊息 (JSON Header)**：
-  ```json
-  {
-    "requestId": "uuid-here",
-    "language": "zhen",
-    "use_vad": true,
-    "secret_key": "test0102"
-  }
-  ```
-- **音訊傳輸 (Binary Chunks)**：
-  客戶端每 160ms 發送 16kHz 16-bit Mono PCM raw binary（5,120 bytes / 2,560 samples）。
-- **服務端即時響應 (JSON)**：
-  ```json
-  {
-    "status": "success",
-    "requestId": "uuid-here",
-    "msg": {
-      "text": "即時辨識新增字詞",
-      "reset": false,
-      "asr_cost_ms": 32.5,
-      "total_cost_ms": 35.1
-    }
-  }
-  ```
-  當說話者停頓約 0.7 秒時，VAD 判定語句結束，將回傳 `{"reset": true}`，前端自動換行並歸檔歷史記錄。
 
 ---
 

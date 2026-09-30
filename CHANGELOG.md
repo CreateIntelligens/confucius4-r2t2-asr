@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.0] - 2026-09-30
+
+### Added
+- **HTTP REST 音訊轉寫端點 (`POST /transcribe`)**：
+  - 於 `server.py` 實作音訊檔案上傳介面，支援 WAV, MP3, FLAC, M4A, OGG 等多種格式，外部 App 可直接發起單次 HTTP 請求獲取轉寫文字。
+- **外部應用程式即時串流示範腳本 (`examples/client_stream_demo.py`)**：
+  - 提供開箱即用的 Python 客戶端範例，示範建立 WebSocket 連線、發送握手 JSON、串流 PCM 音訊切片（160ms chunks）及接收即時增量字幕。
+- **外部 App 調用 API 指南**：
+  - 於 `README.md` 詳細補充 HTTP REST 與 WebSocket 的通訊協定規範、cURL、Python 及 Node.js 呼叫代碼範例。
+- **端點與運行狀態資訊**：
+  - 於 `README.md` 標註外部存取網址（`https://147.5gao.ai/`）、即時字幕網頁介面特色與 GPU 顯存隔離（40% VRAM 與 TTS 服務共存）狀態。
+
+---
+
 ## [1.1.0] - 2026-09-30
 
 ### Added
