@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Confucius4-R2T2 即時語音辨識字幕系統</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: #131b2e;
+      --card-border: #1f2d4d;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --accent-glow: rgba(59, 130, 246, 0.3);
+      --danger: #ef4444;
+      --danger-hover: #dc2626;
+      --success: #10b981;
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --code-bg: #080d1a;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--card-border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(19, 27, 46, 0.7);
+      backdrop-filter: blur(10px);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+
+    .logo-group {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .logo-badge {
+      background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+      color: white;
+      font-weight: 700;
+      font-size: 0.85rem;
+      padding: 0.25rem 0.6rem;
+      border-radius: 6px;
+      letter-spacing: 0.5px;
+    }
+
+    .title {
+      font-size: 1.15rem;
+      font-weight: 600;
+    }
+
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      font-size: 0.85rem;
+    }
+
+    .status-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.25rem 0.65rem;
+      border-radius: 9999px;
+      background: #1e293b;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #64748b;
+    }
+
+    .status-dot.active {
+      background: var(--danger);
+      box-shadow: 0 0 10px var(--danger);
+      animation: pulse 1.5s infinite;
+    }
+
+    .status-dot.connected {
+      background: var(--success);
+      box-shadow: 0 0 10px var(--success);
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(1.2); }
+    }
+
+    main {
+      flex: 1;
+      max-width: 1200px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    /* Hero Subtitle Display */
+    .caption-hero {
+      background: linear-gradient(180deg, #131b2e 0%, #0d1322 100%);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 2rem;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      min-height: 180px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .caption-hero::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: linear-gradient(90deg, #3b82f6, #8b5cf6, #ec4899);
+      opacity: 0.8;
+    }
+
+    .caption-text {
+      font-size: 2.25rem;
+      font-weight: 600;
+      line-height: 1.4;
+      color: #ffffff;
+      min-height: 3.2rem;
+      transition: all 0.2s ease;
+      text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+      max-width: 95%;
+      word-break: break-word;
+    }
+
+    .caption-text .incremental {
+      color: #60a5fa;
+      background: rgba(59, 130, 246, 0.15);
+      padding: 0 4px;
+      border-radius: 4px;
+      animation: fadeIn 0.3s ease-out;
+    }
+
+    .caption-empty {
+      color: var(--text-muted);
+      font-size: 1.25rem;
+      font-weight: 400;
+      font-style: italic;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 2; transform: translateY(2px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .latency-pill {
+      position: absolute;
+      bottom: 12px;
+      right: 16px;
+      font-size: 0.75rem;
+      font-family: var(--font-mono);
+      background: rgba(15, 23, 42, 0.8);
+      padding: 0.2rem 0.6rem;
+      border-radius: 6px;
+      border: 1px solid var(--card-border);
+      color: var(--text-muted);
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    /* Waveform Canvas */
+    .visualizer-container {
+      width: 100%;
+      height: 48px;
+      background: #080d1a;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-top: 1rem;
+      border: 1px solid var(--card-border);
+    }
+
+    canvas#visualizer {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    /* Control Panel */
+    .control-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1.25rem 1.5rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.25rem;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .btn-group {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .btn {
+      padding: 0.75rem 1.5rem;
+      font-size: 1rem;
+      font-weight: 600;
+      border-radius: 10px;
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .btn-record {
+      background: var(--danger);
+      color: white;
+      box-shadow: 0 4px 14px rgba(239, 68, 68, 0.4);
+    }
+
+    .btn-record:hover {
+      background: var(--danger-hover);
+      transform: translateY(-1px);
+    }
+
+    .btn-record.recording {
+      background: #334155;
+      color: #f8fafc;
+      box-shadow: none;
+    }
+
+    .btn-record.recording:hover {
+      background: #475569;
+    }
+
+    .btn-secondary {
+      background: #1e293b;
+      color: var(--text);
+      border: 1px solid var(--card-border);
+    }
+
+    .btn-secondary:hover {
+      background: #334155;
+    }
+
+    .settings-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      align-items: center;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+
+    .field label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .input, .select {
+      background: #090e1a;
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      padding: 0.5rem 0.75rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .input:focus, .select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--accent-glow);
+    }
+
+    /* History transcript */
+    .history-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 1.25rem 1.5rem;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      min-height: 250px;
+    }
+
+    .history-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid var(--card-border);
+    }
+
+    .history-header h3 {
+      font-size: 1rem;
+      font-weight: 600;
+    }
+
+    .history-actions {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .history-btn {
+      background: #1e293b;
+      border: 1px solid var(--card-border);
+      color: var(--text-muted);
+      padding: 0.35rem 0.7rem;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .history-btn:hover {
+      background: #334155;
+      color: var(--text);
+    }
+
+    .history-list {
+      flex: 1;
+      overflow-y: auto;
+      max-height: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      padding-right: 0.5rem;
+    }
+
+    .history-item {
+      padding: 0.75rem 1rem;
+      background: #090e1a;
+      border: 1px solid #1a253e;
+      border-radius: 8px;
+      display: flex;
+      gap: 1rem;
+      align-items: baseline;
+      transition: border-color 0.2s;
+    }
+
+    .history-item:hover {
+      border-color: var(--card-border);
+    }
+
+    .history-time {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .history-content {
+      font-size: 0.95rem;
+      line-height: 1.5;
+      color: #e2e8f0;
+      flex: 1;
+      word-break: break-word;
+    }
+
+    /* OBS / Fullscreen Overlay Mode */
+    body.obs-mode {
+      background: transparent !important;
+    }
+
+    body.obs-mode header,
+    body.obs-mode .control-card,
+    body.obs-mode .history-card,
+    body.obs-mode .visualizer-container,
+    body.obs-mode .latency-pill {
+      display: none !important;
+    }
+
+    body.obs-mode main {
+      padding: 0;
+      justify-content: flex-end;
+      height: 100vh;
+    }
+
+    body.obs-mode .caption-hero {
+      background: rgba(0, 0, 0, 0.75);
+      border: none;
+      border-radius: 12px;
+      margin: 1.5rem;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+    }
+
+    body.obs-mode .caption-text {
+      font-size: 2.75rem;
+      color: #ffffff;
+      text-shadow: 0 2px 8px #000;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #1e293b;
+      border: 1px solid var(--accent);
+      color: white;
+      padding: 0.75rem 1.25rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      z-index: 100;
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all 0.3s ease;
+      pointer-events: none;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo-group">
+      <span class="logo-badge">R2T2</span>
+      <h1 class="title">Confucius4-R2T2 即時串流語音辨識字幕</h1>
+    </div>
+    <div class="status-bar">
+      <div class="status-indicator">
+        <span class="status-dot" id="ws-dot"></span>
+        <span id="ws-status">未連線</span>
+      </div>
+      <button class="history-btn" id="obs-toggle" title="切換為 OBS / 投影片簡報透明字幕模式">OBS 字幕模式</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- 即時字幕展示區 -->
+    <div class="caption-hero">
+      <div class="caption-text" id="caption-box">
+        <span class="caption-empty">點擊下方「開始收音」開始即時語音轉文字...</span>
+      </div>
+      <div class="visualizer-container">
+        <canvas id="visualizer"></canvas>
+      </div>
+      <div class="latency-pill" id="latency-box">
+        <span>ASR 耗時: <strong id="asr-cost">-</strong> ms</span>
+        <span>總延遲: <strong id="total-cost">-</strong> ms</span>
+        <span>音訊區塊: <strong id="chunk-count">0</strong></span>
+      </div>
+    </div>
+
+    <!-- 控制面版 -->
+    <div class="control-card">
+      <div class="btn-group">
+        <button class="btn btn-record" id="record-btn">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+            <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+          </svg>
+          <span id="record-text">開始收音</span>
+        </button>
+      </div>
+
+      <div class="settings-grid">
+        <div class="field">
+          <label for="lang-select">識別語言</label>
+          <select class="select" id="lang-select">
+            <option value="zhen" selected>自動 (中文/英文 Auto)</option>
+            <option value="Chinese">中文 (Chinese)</option>
+            <option value="English">英文 (English)</option>
+            <option value="Cantonese">粵語 (Cantonese)</option>
+            <option value="Japanese">日語 (Japanese)</option>
+            <option value="Korean">韓語 (Korean)</option>
+            <option value="French">法語 (French)</option>
+            <option value="German">德語 (German)</option>
+            <option value="Spanish">西班牙語 (Spanish)</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="context-input">熱詞 / 專用名詞提示</label>
+          <input class="input" id="context-input" type="text" placeholder="例: Confucius4, R2T2, Qwen3" style="width: 200px;">
+        </div>
+
+        <div class="field">
+          <label for="secret-key">連線密鑰</label>
+          <input class="input" id="secret-key" type="password" value="test0102" style="width: 110px;">
+        </div>
+
+        <div class="field">
+          <label for="mic-select">麥克風裝置</label>
+          <select class="select" id="mic-select" style="max-width: 180px;">
+            <option value="">預設麥克風</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- 歷史紀錄面板 -->
+    <div class="history-card">
+      <div class="history-header">
+        <h3>字幕歷史記錄 (<span id="history-count">0</span>)</h3>
+        <div class="history-actions">
+          <button class="history-btn" id="copy-btn">複製文字</button>
+          <button class="history-btn" id="export-btn">下載 TXT</button>
+          <button class="history-btn" id="clear-btn">清空紀錄</button>
+        </div>
+      </div>
+      <div class="history-list" id="history-list"></div>
+    </div>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // --- 狀態管理 ---
+    let isRecording = false;
+    let ws = null;
+    let audioContext = null;
+    let mediaStream = null;
+    let audioProcessor = null;
+    let chunkCounter = 0;
+
+    let currentSegmentText = "";
+    let historyRecords = [];
+
+    // DOM 元素
+    const recordBtn = document.getElementById('record-btn');
+    const recordText = document.getElementById('record-text');
+    const wsDot = document.getElementById('ws-dot');
+    const wsStatus = document.getElementById('ws-status');
+    const captionBox = document.getElementById('caption-box');
+    const asrCostEl = document.getElementById('asr-cost');
+    const totalCostEl = document.getElementById('total-cost');
+    const chunkCountEl = document.getElementById('chunk-count');
+    const langSelect = document.getElementById('lang-select');
+    const contextInput = document.getElementById('context-input');
+    const secretKeyInput = document.getElementById('secret-key');
+    const micSelect = document.getElementById('mic-select');
+    const historyList = document.getElementById('history-list');
+    const historyCount = document.getElementById('history-count');
+    const copyBtn = document.getElementById('copy-btn');
+    const exportBtn = document.getElementById('export-btn');
+    const clearBtn = document.getElementById('clear-btn');
+    const obsToggle = document.getElementById('obs-toggle');
+    const toastEl = document.getElementById('toast');
+    const canvas = document.getElementById('visualizer');
+    const canvasCtx = canvas.getContext('2d');
+
+    // 視波器變數
+    let analyserNode = null;
+    let animFrameId = null;
+
+    // 提示通知
+    function showToast(msg) {
+      toastEl.textContent = msg;
+      toastEl.classList.add('show');
+      setTimeout(() => toastEl.classList.remove('show'), 2500);
+    }
+
+    // 列出音訊設備
+    async function loadAudioDevices() {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter(d => d.kind === 'audioinput');
+        micSelect.innerHTML = '<option value="">預設麥克風</option>';
+        audioInputs.forEach((device, index) => {
+          const opt = document.createElement('option');
+          opt.value = device.deviceId;
+          opt.textContent = device.label || `麥克風 ${index + 1}`;
+          micSelect.appendChild(opt);
+        });
+      } catch (err) {
+        console.warn('無法枚舉音訊設備:', err);
+      }
+    }
+    navigator.mediaDevices?.addEventListener('devicechange', loadAudioDevices);
+    loadAudioDevices();
+
+    // 視波器繪製
+    function drawVisualizer() {
+      if (!analyserNode) return;
+      const bufferLength = analyserNode.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+      analyserNode.getByteTimeDomainData(dataArray);
+
+      canvas.width = canvas.offsetWidth * window.devicePixelRatio;
+      canvas.height = canvas.offsetHeight * window.devicePixelRatio;
+      canvasCtx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+      const width = canvas.offsetWidth;
+      const height = canvas.offsetHeight;
+
+      canvasCtx.fillStyle = '#080d1a';
+      canvasCtx.fillRect(0, 0, width, height);
+
+      canvasCtx.lineWidth = 2;
+      canvasCtx.strokeStyle = isRecording ? '#3b82f6' : '#334155';
+      canvasCtx.beginPath();
+
+      const sliceWidth = width * 1.0 / bufferLength;
+      let x = 0;
+
+      for (let i = 0; i < bufferLength; i++) {
+        const v = dataArray[i] / 128.0;
+        const y = v * height / 2;
+
+        if (i === 0) {
+          canvasCtx.moveTo(x, y);
+        } else {
+          canvasCtx.lineTo(x, y);
+        }
+        x += sliceWidth;
+      }
+
+      canvasCtx.lineTo(width, height / 2);
+      canvasCtx.stroke();
+
+      if (isRecording) {
+        animFrameId = requestAnimationFrame(drawVisualizer);
+      }
+    }
+
+    // 重設畫布
+    function resetVisualizer() {
+      canvas.width = canvas.offsetWidth;
+      canvas.height = canvas.offsetHeight;
+      canvasCtx.fillStyle = '#080d1a';
+      canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+      canvasCtx.strokeStyle = '#1e293b';
+      canvasCtx.beginPath();
+      canvasCtx.moveTo(0, canvas.height / 2);
+      canvasCtx.lineTo(canvas.width, canvas.height / 2);
+      canvasCtx.stroke();
+    }
+    resetVisualizer();
+
+    // --- 音訊重採樣至 16000Hz PCM Int16 ---
+    function resampleAndConvertToInt16(audioBuffer, inputSampleRate, targetSampleRate = 16000) {
+      const ratio = inputSampleRate / targetSampleRate;
+      const newLength = Math.round(audioBuffer.length / ratio);
+      const result = new Int16Array(newLength);
+      for (let i = 0; i < newLength; i++) {
+        const origIndex = i * ratio;
+        const indexFloor = Math.floor(origIndex);
+        const indexCeil = Math.min(audioBuffer.length - 1, indexFloor + 1);
+        const fraction = origIndex - indexFloor;
+        const sample = (audioBuffer[indexFloor] * (1 - fraction) + audioBuffer[indexCeil] * fraction);
+        const clamped = Math.max(-1, Math.min(1, sample));
+        result[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+      }
+      return result;
+    }
+
+    // 切換 OBS 模式
+    obsToggle.addEventListener('click', () => {
+      document.body.classList.toggle('obs-mode');
+      if (document.body.classList.contains('obs-mode')) {
+        showToast('已開啟 OBS 模式 (再按一次退出)');
+      }
+    });
+
+    // 建立 UUID
+    function generateUUID() {
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    }
+
+    // 開始錄音
+    async function startRecording() {
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/asr_stream_api_v1`;
+
+        wsStatus.textContent = '連線中...';
+        wsDot.className = 'status-dot';
+
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = async () => {
+          wsDot.className = 'status-dot connected';
+          wsStatus.textContent = '服務已連線';
+
+          // 發送 Handshake JSON Header
+          const reqId = generateUUID();
+          const header = {
+            channels: 1,
+            sample_rate: 16000,
+            requestId: reqId,
+            language: langSelect.value,
+            use_vad: true,
+            secret_key: secretKeyInput.value.trim() || 'test0102',
+            mode: 'slow',
+            system_prompt: contextInput.value.trim()
+          };
+          ws.send(JSON.stringify(header));
+
+          // 啟動瀏覽器麥克風
+          const deviceId = micSelect.value ? { exact: micSelect.value } : undefined;
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              deviceId: deviceId,
+              channelCount: 1,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          const source = audioContext.createMediaStreamSource(mediaStream);
+
+          analyserNode = audioContext.createAnalyser();
+          analyserNode.fftSize = 512;
+          source.connect(analyserNode);
+
+          // 160ms = 2560 samples at 16000Hz
+          const TARGET_CHUNK_SAMPLES = 2560;
+          const inputSampleRate = audioContext.sampleRate;
+
+          audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+          let pcmBufferAccumulator = [];
+
+          audioProcessor.onaudioprocess = (e) => {
+            if (!isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
+            const channelData = e.inputBuffer.getChannelData(0);
+            
+            const int16Data = resampleAndConvertToInt16(channelData, inputSampleRate, 16000);
+            
+            for (let i = 0; i < int16Data.length; i++) {
+              pcmBufferAccumulator.push(int16Data[i]);
+            }
+
+            while (pcmBufferAccumulator.length >= TARGET_CHUNK_SAMPLES) {
+              const chunk = new Int16Array(pcmBufferAccumulator.slice(0, TARGET_CHUNK_SAMPLES));
+              pcmBufferAccumulator = pcmBufferAccumulator.slice(TARGET_CHUNK_SAMPLES);
+              ws.send(chunk.buffer);
+              chunkCounter++;
+              chunkCountEl.textContent = chunkCounter;
+            }
+          };
+
+          source.connect(audioProcessor);
+          audioProcessor.connect(audioContext.destination);
+
+          isRecording = true;
+          recordBtn.classList.add('recording');
+          recordText.textContent = '停止收音';
+          wsDot.className = 'status-dot active';
+          wsStatus.textContent = '即時推論中';
+          currentSegmentText = "";
+          captionBox.innerHTML = '<span class="caption-empty">聆聽中...</span>';
+
+          drawVisualizer();
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.status === 'connected') {
+              console.log('R2T2 handshake confirmed:', data);
+              return;
+            }
+
+            if (data.status === 'success' && data.msg) {
+              const newText = data.msg.text || '';
+              const reset = data.msg.reset || false;
+
+              if (data.msg.asr_cost_ms !== undefined) {
+                asrCostEl.textContent = Number(data.msg.asr_cost_ms).toFixed(1);
+              }
+              if (data.msg.total_cost_ms !== undefined) {
+                totalCostEl.textContent = Number(data.msg.total_cost_ms).toFixed(1);
+              }
+
+              if (newText) {
+                currentSegmentText += newText;
+                captionBox.innerHTML = `${escapeHtml(currentSegmentText)}<span class="incremental"></span>`;
+              }
+
+              if (reset && currentSegmentText.trim()) {
+                commitHistorySegment(currentSegmentText);
+                currentSegmentText = "";
+                captionBox.innerHTML = '<span class="caption-empty">聆聽中...</span>';
+              }
+            } else if (data.status === 'error') {
+              console.error('Server error:', data.msg);
+              showToast('辨識錯誤: ' + data.msg);
+            }
+          } catch (e) {
+            console.warn('非 JSON 訊息:', event.data);
+          }
+        };
+
+        ws.onerror = (err) => {
+          console.error('WebSocket 錯誤:', err);
+          showToast('WebSocket 連線異常');
+          stopRecording();
+        };
+
+        ws.onclose = () => {
+          wsDot.className = 'status-dot';
+          wsStatus.textContent = '連線關閉';
+          stopRecording();
+        };
+
+      } catch (err) {
+        console.error('開啟麥克風失敗:', err);
+        showToast('無法存取麥克風: ' + err.message);
+        stopRecording();
+      }
+    }
+
+    // 停止錄音
+    function stopRecording() {
+      if (!isRecording && !ws) return;
+      isRecording = false;
+
+      recordBtn.classList.remove('recording');
+      recordText.textContent = '開始收音';
+      wsDot.className = 'status-dot';
+      wsStatus.textContent = '已停止';
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send("YOUDAO_ONETIME_ASR_STREAM_EOS");
+        setTimeout(() => {
+          try { ws.close(); } catch(e){}
+          ws = null;
+        }, 500);
+      }
+
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+      }
+      if (audioProcessor) {
+        try { audioProcessor.disconnect(); } catch(e){}
+        audioProcessor = null;
+      }
+      if (audioContext && audioContext.state !== 'closed') {
+        try { audioContext.close(); } catch(e){}
+        audioContext = null;
+      }
+
+      if (currentSegmentText.trim()) {
+        commitHistorySegment(currentSegmentText);
+        currentSegmentText = "";
+      }
+
+      cancelAnimationFrame(animFrameId);
+      resetVisualizer();
+    }
+
+    // 寫入歷史紀錄
+    function commitHistorySegment(text) {
+      if (!text || !text.trim()) return;
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0').slice(0, 2);
+      
+      const record = { time: timeStr, text: text.trim() };
+      historyRecords.unshift(record);
+
+      const itemEl = document.createElement('div');
+      itemEl.className = 'history-item';
+      itemEl.innerHTML = `
+        <span class="history-time">[${timeStr}]</span>
+        <span class="history-content">${escapeHtml(text.trim())}</span>
+      `;
+      historyList.prepend(itemEl);
+      historyCount.textContent = historyRecords.length;
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/[&<>"']/g, function(m) {
+        return ({
+          '&': '&amp;',
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#039;'
+        })[m];
+      });
+    }
+
+    // 按鈕監聽
+    recordBtn.addEventListener('click', () => {
+      if (isRecording) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    });
+
+    // 複製文字
+    copyBtn.addEventListener('click', () => {
+      if (historyRecords.length === 0) {
+        showToast('目前尚無記錄');
+        return;
+      }
+      const fullText = historyRecords.map(r => `[${r.time}] ${r.text}`).reverse().join('\n');
+      navigator.clipboard.writeText(fullText).then(() => {
+        showToast('已複製全部字幕到剪貼簿');
+      });
+    });
+
+    // 匯出 TXT
+    exportBtn.addEventListener('click', () => {
+      if (historyRecords.length === 0) {
+        showToast('目前尚無記錄');
+        return;
+      }
+      const fullText = historyRecords.map(r => `[${r.time}] ${r.text}`).reverse().join('\n');
+      const blob = new Blob([fullText], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `r2t2_subtitles_${new Date().toISOString().slice(0, 10)}.txt`;
+      a.click();
+    });
+
+    // 清空紀錄
+    clearBtn.addEventListener('click', () => {
+      historyRecords = [];
+      historyList.innerHTML = '';
+      historyCount.textContent = '0';
+      captionBox.innerHTML = '<span class="caption-empty">已清空紀錄。點擊「開始收音」開始</span>';
+      showToast('紀錄已清空');
+    });
+
+    // 空白鍵快捷鍵切換錄音
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space' && e.target === document.body) {
+        e.preventDefault();
+        recordBtn.click();
+      }
+    });
+  </script>
+</body>
+</html>

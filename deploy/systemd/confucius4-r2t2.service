@@ -1,0 +1,18 @@
+[Unit]
+Description=Confucius4-R2T2 Streaming ASR & Real-time Subtitles Service
+After=network.target
+
+[Service]
+Type=simple
+User=david
+WorkingDirectory=/home/david/r2t2-service
+Environment="PYTHONPATH=/home/david/r2t2-service/Confucius4-R2T2"
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="VLLM_GPU_MEMORY_UTILIZATION=0.40"
+Environment="VLLM_MAX_MODEL_LEN=2048"
+ExecStart=/home/david/r2t2-service/.venv/bin/python /home/david/r2t2-service/server.py --port 8040 --ip 0.0.0.0 --gpu_mem_util 0.40 --max_model_len 2048
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

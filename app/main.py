@@ -250,6 +250,25 @@ def healthz() -> HealthResponse:
     )
 
 
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return healthz()
+
+
+@app.get("/")
+def serve_index():
+    web_dir = os.environ.get("WEB_DIR", "/web")
+    if not os.path.exists(web_dir):
+        local_web = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web")
+        if os.path.exists(local_web):
+            web_dir = local_web
+    index_file = os.path.join(web_dir, "index.html")
+    if os.path.exists(index_file):
+        from fastapi.responses import FileResponse
+        return FileResponse(index_file)
+    return {"status": "ok", "service": "Confucius4-R2T2 ASR Service"}
+
+
 def _require_model():
     model = STATE["model"]
     if model is None:
