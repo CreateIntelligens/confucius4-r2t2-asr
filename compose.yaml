@@ -1,0 +1,54 @@
+services:
+  r2t2-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: confucius-r2t2-asr:local
+    container_name: r2t2-api
+    restart: unless-stopped
+    environment:
+      MODEL_DIR: /model
+      MODEL_ID: ${MODEL_ID:-netease-youdao/Confucius4-R2T2}
+      ASR_BACKEND: ${ASR_BACKEND:-auto}
+      AUTO_DOWNLOAD: ${AUTO_DOWNLOAD:-1}
+      AUTO_WARMUP: ${AUTO_WARMUP:-1}
+      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-0.35}
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - r2t2-model:/model
+      - ./app:/app
+    working_dir: /app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 600s
+
+  r2t2-nginx:
+    image: nginx:1.27-alpine
+    container_name: r2t2-nginx
+    restart: unless-stopped
+    depends_on:
+      - r2t2-api
+    ports:
+      - "${PUBLIC_PORT:-8803}:${PUBLIC_PORT:-8803}"
+    environment:
+      PUBLIC_PORT: ${PUBLIC_PORT:-8803}
+      UPSTREAM_HOST: r2t2-api
+      UPSTREAM_PORT: 8000
+      NGINX_ENVSUBST_FILTER: "^(PUBLIC_PORT|UPSTREAM_HOST|UPSTREAM_PORT)"
+    volumes:
+      - ./nginx.template:/etc/nginx/templates/default.conf.template:ro
+
+volumes:
+  r2t2-model:
