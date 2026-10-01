@@ -700,15 +700,30 @@ private:
     llama_pos prefill_only_with_embedding(
             const py::array_t<float, py::array::c_style | py::array::forcecast> & external_embd,
             const std::string & prompt) {
-        if (external_embd.ndim() != 2 || external_embd.shape(0) == 0) {
-            throw std::invalid_argument(
-                    "external_embd must be a non-empty 2-D [n_tokens, n_embd] float32 array");
-        }
         const int32_t n_embd_inp = llama_model_n_embd_inp(model_.get());
-        if (static_cast<int32_t>(external_embd.shape(1)) != n_embd_inp) {
-            throw std::invalid_argument(
-                    "external_embd second dim (" + std::to_string(external_embd.shape(1)) +
-                    ") must equal llama_model_n_embd_inp (" + std::to_string(n_embd_inp) + ")");
+        // Callers reach this with the GIL released (generate_once_with_embedding
+        // drops it for the whole decode). Reading the numpy array is a Python
+        // C-API access, so take the GIL back just for the copy: without it,
+        // other Python threads race this read and the copy sees garbage sizes
+        // ("cannot create std::vector larger than max_size()") or segfaults.
+        std::vector<float> embd_buf;
+        int32_t n_embd_tokens = 0;
+        {
+            py::gil_scoped_acquire acquire;
+            if (external_embd.ndim() != 2 || external_embd.shape(0) == 0) {
+                throw std::invalid_argument(
+                        "external_embd must be a non-empty 2-D [n_tokens, n_embd] float32 array");
+            }
+            if (static_cast<int32_t>(external_embd.shape(1)) != n_embd_inp) {
+                throw std::invalid_argument(
+                        "external_embd second dim (" + std::to_string(external_embd.shape(1)) +
+                        ") must equal llama_model_n_embd_inp (" + std::to_string(n_embd_inp) + ")");
+            }
+            const auto embd_info = external_embd.request();
+            embd_buf.assign(
+                    static_cast<const float *>(embd_info.ptr),
+                    static_cast<const float *>(embd_info.ptr) + external_embd.size());
+            n_embd_tokens = static_cast<int32_t>(external_embd.shape(0));
         }
 
         const std::string marker = "<|audio_pad|>";
@@ -721,12 +736,6 @@ private:
         }
         const std::string pre_text = prompt.substr(0, marker_pos);
         const std::string post_text = prompt.substr(marker_pos + marker.size());
-
-        const auto embd_info = external_embd.request();
-        std::vector<float> embd_buf(
-                static_cast<const float *>(embd_info.ptr),
-                static_cast<const float *>(embd_info.ptr) + external_embd.size());
-        const int32_t n_embd_tokens = static_cast<int32_t>(external_embd.shape(0));
 
         llama_memory_clear(llama_get_memory(context_.get()), true);
         const llama_vocab * vocab = llama_model_get_vocab(model_.get());
