@@ -13,6 +13,7 @@ import re
 import asyncio
 import logging
 import argparse
+import threading
 import traceback
 import numpy as np
 from typing import Optional
@@ -204,6 +205,105 @@ def resolve_qwen_context(header, smooth):
 asr_model = None
 stream_vad = None
 
+# 單次推論卡超過這個秒數，/health 就回報 stalled。
+STALL_SECONDS = 60
+
+
+class InferGate:
+    """One lock for every call into the vLLM engine.
+
+    ``R2T2ASRModel.LLM`` is a single synchronous engine. Calling it from
+    several threads at once wedged the service for good (every request
+    timed out while /health kept saying healthy), and calling it on the
+    event loop froze every other connection for the length of the step.
+    All model calls therefore run in a worker thread, one at a time.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.waiting = 0
+        self.busy_since = None
+        self.last_ok = None
+        self.max_wait = 0.0
+
+    def call(self, fn, *args, **kwargs):
+        t_wait = time.monotonic()
+        self.waiting += 1
+        with self._lock:
+            self.waiting -= 1
+            self.max_wait = max(self.max_wait, time.monotonic() - t_wait)
+            self.busy_since = time.monotonic()
+            try:
+                result = fn(*args, **kwargs)
+                self.last_ok = time.monotonic()
+                return result
+            finally:
+                self.busy_since = None
+
+    def snapshot(self):
+        now = time.monotonic()
+        busy_since, last_ok = self.busy_since, self.last_ok
+        return {
+            "waiting": self.waiting,
+            "busy_seconds": round(now - busy_since, 2) if busy_since is not None else 0.0,
+            "last_success_seconds_ago": round(now - last_ok, 2) if last_ok is not None else None,
+            "max_wait_seconds": round(self.max_wait, 3),
+        }
+
+
+infer_gate = InferGate()
+
+
+async def run_infer(fn, *args, **kwargs):
+    """Run one model call off the event loop, queued behind the others."""
+    return await asyncio.to_thread(infer_gate.call, fn, *args, **kwargs)
+
+
+def new_stream_vad():
+    """Give one connection its own VAD state on top of the shared weights.
+
+    FireRedStreamVad keeps feature, model-cache and state-machine state on
+    the instance; sharing one instance mixed the audio of concurrent
+    streams and most sentences never got their speech-end.
+    """
+    if stream_vad is None:
+        return None
+    from fireredvad import FireRedStreamVad
+    from fireredvad.core.audio_feat import AudioFeat
+    from fireredvad.core.stream_vad_postprocessor import StreamVadPostprocessor
+
+    cfg = stream_vad.config
+    return FireRedStreamVad(
+        AudioFeat(os.path.join(args.vad_model_path, "cmvn.ark")),
+        stream_vad.vad_model,
+        StreamVadPostprocessor(
+            cfg.smooth_window_size,
+            cfg.speech_threshold,
+            cfg.pad_start_frame,
+            cfg.min_speech_frame,
+            cfg.max_speech_frame,
+            cfg.min_silence_frame,
+        ),
+        cfg,
+    )
+
+
+def resolve_stream_language(header):
+    """Map the header's language to what the model takes (None = auto-detect).
+
+    「zhen」（中英混講）對應成 Chinese：交給自動判斷時，模型只憑開頭 0.3 秒
+    就鎖定語言，帶口音的華語曾被整句轉成葡萄牙文。要自動判斷請明確送 auto。
+    """
+    language = str(header.get("language") or "zhen").strip()
+    low = language.lower()
+    if low == "auto":
+        return None
+    if low in ("zhen", "zh", "zh-cn", "zh-tw", "chinese"):
+        return "Chinese"
+    if low in ("en", "english"):
+        return "English"
+    return language
+
 @app.listener('before_server_start')
 async def initialize_models(app):
     global stream_vad, asr_model
@@ -313,13 +413,16 @@ async def handle_index(request: Request):
 
 @app.route("/health")
 async def handle_health(request: Request):
+    inference = infer_gate.snapshot()
+    stalled = inference["busy_seconds"] > STALL_SECONDS
     return response.json({
-        "status": "healthy",
+        "status": "stalled" if stalled else "healthy",
         "service": "Confucius4-R2T2",
         "active_connections": active_connections,
         "gpu_mem_util": args.gpu_mem_util,
-        "model_loaded": asr_model is not None
-    })
+        "model_loaded": asr_model is not None,
+        "inference": inference,
+    }, status=503 if stalled else 200)
 
 
 def _decode_audio_bytes(content: bytes) -> np.ndarray:
@@ -341,8 +444,14 @@ def _decode_audio_bytes(content: bytes) -> np.ndarray:
     return wav.astype(np.float32)
 
 
-def _transcribe_audio_segment(wav: np.ndarray, context: str, language: Optional[str]) -> str:
-    state = asr_model.init_streaming_state(
+async def transcribe_audio_segment(wav: np.ndarray, context: str, language: Optional[str]) -> str:
+    """Decode one segment of an uploaded file, queueing every step on its own.
+
+    每一步解碼各自排隊：整段包成一次呼叫的話，30 秒的片段會讓串流連線停擺好幾秒；
+    不排隊直接丟執行緒則會和其他請求同時呼叫引擎，把服務卡死。
+    """
+    state = await run_infer(
+        asr_model.init_streaming_state,
         context=context or "",
         language=language,
         unfixed_chunk_num=0,
@@ -352,8 +461,8 @@ def _transcribe_audio_segment(wav: np.ndarray, context: str, language: Optional[
     step_samples = int(round(0.32 * 16000))
     max_tokens = 4
     for start in range(0, len(wav), step_samples):
-        asr_model.streaming_transcribe(wav[start : start + step_samples], state, max_tokens)
-    asr_model.finish_streaming_transcribe(state, max_tokens)
+        await run_infer(asr_model.streaming_transcribe, wav[start : start + step_samples], state, max_tokens)
+    await run_infer(asr_model.finish_streaming_transcribe, state, max_tokens)
     return state.text.split("|")[0].strip()
 
 @app.route("/transcribe", methods=["POST"])
@@ -376,25 +485,17 @@ async def handle_transcribe(request: Request):
         wav = await asyncio.to_thread(_decode_audio_bytes, file.body)
         duration_sec = round(len(wav) / 16000.0, 2)
 
-        def run_infer():
-            t0 = time.time()
-            lang_param = None
-            if language:
-                if language.lower() in ("chinese", "zh", "zhen"):
-                    lang_param = "Chinese"
-                elif language.lower() in ("english", "en"):
-                    lang_param = "English"
+        t0 = time.time()
+        lang_param = resolve_stream_language({"language": language or "auto"})
+        segment_texts = []
+        for start in range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES):
+            segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
+            text = await transcribe_audio_segment(segment, context or "", lang_param)
+            if text:
+                segment_texts.append(text)
+        text = "\n".join(segment_texts)
+        cost_ms = round((time.time() - t0) * 1000, 1)
 
-            segment_texts = []
-            for start in range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES):
-                segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
-                text = _transcribe_audio_segment(segment, context or "", lang_param)
-                if text:
-                    segment_texts.append(text)
-            cost_ms = round((time.time() - t0) * 1000, 1)
-            return "\n".join(segment_texts), cost_ms
-
-        text, cost_ms = await asyncio.to_thread(run_infer)
         return response.json({
             "status": "success",
             "text": text,
@@ -423,12 +524,7 @@ async def handle_transcribe_stream(request: Request):
         logger.exception(f"Audio decode error: {e}")
         return response.json({"status": "error", "message": "無法讀取音訊檔案，請確認檔案格式後重試。"}, status=400)
 
-    lang_param = None
-    if language:
-        if language.lower() in ("chinese", "zh", "zhen"):
-            lang_param = "Chinese"
-        elif language.lower() in ("english", "en"):
-            lang_param = "English"
+    lang_param = resolve_stream_language({"language": language or "auto"})
 
     duration_sec = len(wav) / 16000.0
     total_segments = max(1, (len(wav) + TRANSCRIBE_SEGMENT_SAMPLES - 1) // TRANSCRIBE_SEGMENT_SAMPLES)
@@ -452,12 +548,7 @@ async def handle_transcribe_stream(request: Request):
     for index, start in enumerate(range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES), start=1):
         segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
         try:
-            text = await asyncio.to_thread(
-                _transcribe_audio_segment,
-                segment,
-                context or "",
-                lang_param,
-            )
+            text = await transcribe_audio_segment(segment, context or "", lang_param)
         except Exception as e:
             logger.exception("Audio segment %s/%s failed: %s", index, total_segments, e)
             await stream.send(send_event({"type": "error", "message": str(e)}))
@@ -539,9 +630,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
 
             requestId = header.get("requestId", None)
             use_vad = header.get("use_vad", True)
-            language = header.get("language", "zhen")
-            if language == "zhen":
-                language = None
+            language = resolve_stream_language(header)
             secret_key = header.get("secret_key", None)
             smooth = header.get("smooth", False)
 
@@ -563,7 +652,9 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
             step = int(round(STEP_MS / 1000.0 * sr))
             lookahead = int(round(LOOKAHEAD_MS / 1000.0 * sr))
 
-            asr_state = asr_model.init_streaming_state(
+            # 建立 state 會用到 tokenizer，它不能跨執行緒同時使用，所以也要排隊。
+            asr_state = await run_infer(
+                asr_model.init_streaming_state,
                 context=context,
                 language=language,
                 unfixed_chunk_num=0,
@@ -571,8 +662,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 chunk_size_sec=CHUNK_ASR_SECONDS,
             )
 
-            if use_vad and stream_vad is not None:
-                stream_vad.reset()
+            conn_vad = new_stream_vad() if use_vad else None
 
             max_new_tokens = max(1, int((step + lookahead) / 1280))
             max_new_tokens_floor = min(32, max(4, 2 * int(step / 1280)))
@@ -594,7 +684,8 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 if isinstance(data, str):
                     if data == YOUDAO_ONETIME_ASR_EOS_STRING:
                         first_max_new_tokens = max(1, int((step + lookahead) / 1280))
-                        text = asr_model.finish_streaming_transcribe_no_reset(
+                        text = await run_infer(
+                            asr_model.finish_streaming_transcribe_no_reset,
                             asr_state, first_max_new_tokens
                         )
                         text = text.split("|")[0]
@@ -644,17 +735,18 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                     # Streaming VAD
                     speech_ended_in_this_chunk = False
                     vad_cost_ms = 0.0
-                    if use_vad and stream_vad is not None:
+                    if conn_vad is not None:
                         audio_chunk_int16 = (audio_chunk * 32768.0).clip(-32768, 32767).astype(np.int16)
                         t0 = time.time()
-                        chunk_results = stream_vad.detect_chunk(audio_chunk_int16)
+                        chunk_results = conn_vad.detect_chunk(audio_chunk_int16)
                         for r in chunk_results:
                             if r.is_speech_end:
                                 speech_ended_in_this_chunk = True
                         vad_cost_ms = round((time.time() - t0) * 1000, 1)
 
                     t0 = time.time()
-                    text, fixed_asr_text = asr_model.streaming_transcribe_no_reset(
+                    text, fixed_asr_text = await run_infer(
+                        asr_model.streaming_transcribe_no_reset,
                         audio_chunk, asr_state, int(max_new_tokens), False
                     )
                     fixed_asr_text = fixed_asr_text.split("|")[0]
@@ -690,7 +782,8 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                     # Speech end / VAD pause
                     if speech_ended_in_this_chunk and use_vad:
                         seg_final_text = asr_state.text.split("|")[0]
-                        asr_state = asr_model.init_streaming_state(
+                        asr_state = await run_infer(
+                            asr_model.init_streaming_state,
                             context=context,
                             language=language,
                             unfixed_chunk_num=0,
@@ -721,7 +814,8 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 did_reset = False
                 if is_halluc:
                     logger.info(f"requestId={requestId}: hallucination reset, reason={halluc_reason}")
-                    text = asr_model.finish_streaming_transcribe_no_reset(
+                    text = await run_infer(
+                        asr_model.finish_streaming_transcribe_no_reset,
                         asr_state, max(1, int((step + lookahead) / 1280))
                     )
                     text = text.split("|")[0]
@@ -730,7 +824,8 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                     else:
                         new_asr_text = ""
                     out_msg = {"text": new_asr_text, "reset": True}
-                    asr_state = asr_model.init_streaming_state(
+                    asr_state = await run_infer(
+                        asr_model.init_streaming_state,
                         context=context,
                         language=language,
                         unfixed_chunk_num=0,
