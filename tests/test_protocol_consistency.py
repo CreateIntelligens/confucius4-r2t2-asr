@@ -73,10 +73,11 @@ def test_upload_stream_events_match_between_servers_and_ui():
     for server in ("server.py", "app/main.py"):
         source = read(server)
         assert '"/transcribe/stream"' in source
-        for event_type in ("start", "segment", "done", "error"):
+        assert '"/transcribe/cancel"' in source
+        for event_type in ("start", "segment", "done", "error", "cancelled"):
             assert f'"type": "{event_type}"' in source, (server, event_type)
             assert f"event.type === '{event_type}'" in ui
-        for field in ("total_segments", "duration_sec", "start_sec", "end_sec", "index", "total", "text"):
+        for field in ("job_id", "completed_segments", "output_script", "total_segments", "duration_sec", "start_sec", "end_sec", "index", "total", "text"):
             assert f'"{field}"' in source, (server, field)
 
 
@@ -84,3 +85,13 @@ def test_both_servers_serve_the_ui_assets():
     assert 'app.static("/assets"' in read("server.py")
     assert 'app.mount("/assets"' in read("app/main.py")
     assert 'src="/assets/app.js"' in read("web/index.html")
+
+
+def test_both_servers_accept_the_same_output_scripts():
+    from script_convert import OUTPUT_SCRIPTS
+
+    server = read("server.py")
+    for script in OUTPUT_SCRIPTS:
+        assert f'"{script}"' in server
+        assert f'value="{script}"' in read("web/index.html")
+    assert 'OpenCC("s2twp")' in server and 'OpenCC("s2twp")' in read("app/script_convert.py")

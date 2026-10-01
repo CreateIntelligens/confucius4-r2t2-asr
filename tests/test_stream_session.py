@@ -200,3 +200,32 @@ def test_repetition_forces_a_reset_without_final_pass():
     assert resets and resets[0]["final_pass"] is False
     assert model.transcribed == []
     assert len(resets[0]["final_text"]) < 8
+
+
+def test_traditional_output_converts_deltas_and_final_text():
+    model = FakeModel(script="请问软件在哪里", final="请问软件在哪里。")
+    session = make(model, FakeVad(start_at=0, end_at=6), output_script="traditional")
+    msgs = feed_one_by_one(session, 8)
+    end = [m for m in msgs if m["reset"]][0]
+    streamed = "".join(m["text"] for m in msgs[: msgs.index(end) + 1])
+    # the phrase 软件 arrives one character per step and still becomes 軟體
+    assert streamed == "請問軟體在哪裡"
+    assert end["final_text"] == "請問軟體在哪裡。"
+
+
+def test_finish_keeps_the_text_decoded_from_the_tail():
+    model = FakeModel(script="今天下午開會")
+    session = make(model, FakeVad(start_at=0, end_at=99))
+    streamed = "".join(m["msg"]["text"] for m in feed_one_by_one_raw(session, 3))
+    session.feed(np.zeros(100, dtype=np.float32))
+    end = session.finish()["msg"]
+    # three full chunks plus the tail are four decode steps; nothing they produced may be lost
+    assert len(model.steps) == 4
+    assert streamed + end["text"] == model.script[:4]
+
+
+def feed_one_by_one_raw(session, n):
+    msgs = []
+    for _ in range(n):
+        msgs += session.feed(chunks(1))
+    return msgs

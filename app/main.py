@@ -21,6 +21,7 @@ import platform
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -48,6 +49,7 @@ os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 from audio_io import load_audio
 from infer_gate import InferGate
 from r2t2 import R2T2ASRModel
+from script_convert import convert_text, resolve_output_script
 from stream_session import StreamSession, unfixed_tail
 from textproc import clean_transcript, normalize_language
 from vad import load_vad_factory
@@ -103,6 +105,9 @@ STATE = {
 }
 
 GATE = InferGate()
+
+# 進行中的上傳辨識：job_id -> 取消旗標。/transcribe/cancel 設旗標，辨識迴圈在段與段之間檢查。
+UPLOAD_JOBS: dict = {}
 
 
 def _ensure_model_downloaded() -> None:
@@ -364,6 +369,17 @@ def _batch_language(model, language: Optional[str]) -> Optional[str]:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+def _output_script(value: Optional[str]) -> str:
+    try:
+        return resolve_output_script(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class CancelRequest(BaseModel):
+    job_id: str
+
+
 async def _save_upload(file: UploadFile) -> str:
     content = await file.read()
     suffix = Path(file.filename or "tmp.wav").suffix
@@ -393,10 +409,12 @@ async def transcribe(
     file: UploadFile = File(..., description="音訊檔案 (wav, mp3, m4a, flac 等)"),
     language: Optional[str] = Form(None, description="語言指定 (如 Chinese, English, zh, zhen；不填為自動判斷)"),
     context: Optional[str] = Form("", description="熱詞或上下文提示詞 (如：請使用台灣繁體中文)"),
+    output_script: Optional[str] = Form(None, description="輸出文字：simplified（預設）或 traditional（台灣繁體）"),
 ):
     """一般離線單檔轉寫 (支援防跳針清洗與自訂上下文/熱詞)；超過 30 秒自動分段，各段以換行串接"""
     model = _require_model()
     lang_param = _batch_language(model, language)
+    script = _output_script(output_script)
     tmp_path = await _save_upload(file)
 
     try:
@@ -405,7 +423,7 @@ async def transcribe(
         raw_parts, clean_parts = [], []
         for _, segment in _segments(wav):
             raw = await asyncio.to_thread(_transcribe_segment, model, segment, context or "", lang_param)
-            clean = clean_transcript(raw)
+            clean = convert_text(clean_transcript(raw), script)
             if clean:
                 raw_parts.append(raw)
                 clean_parts.append(clean)
@@ -436,10 +454,12 @@ async def transcribe_stream(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     context: Optional[str] = Form(""),
+    output_script: Optional[str] = Form(None),
 ):
-    """長音檔逐段辨識 (Server-Sent Events)：start → 每 30 秒一則 segment → done"""
+    """長音檔逐段辨識 (Server-Sent Events)：start → 每 30 秒一則 segment → done（或 cancelled）"""
     model = _require_model()
     lang_param = _batch_language(model, language)
+    script = _output_script(output_script)
     tmp_path = await _save_upload(file)
     try:
         wav = await asyncio.to_thread(load_audio, tmp_path)
@@ -457,51 +477,77 @@ async def transcribe_stream(
         duration_sec = len(wav) / 16000.0
         total = max(1, (len(wav) + TRANSCRIBE_SEGMENT_SAMPLES - 1) // TRANSCRIBE_SEGMENT_SAMPLES)
         started_at = time.time()
-        yield event(
-            {
-                "type": "start",
-                "duration_sec": round(duration_sec, 2),
-                "total_segments": total,
-                "segment_seconds": TRANSCRIBE_SEGMENT_SECONDS,
-            }
-        )
-        texts = []
-        for index, (start, segment) in enumerate(_segments(wav), start=1):
-            try:
-                raw = await asyncio.to_thread(_transcribe_segment, model, segment, context or "", lang_param)
-            except Exception as exc:
-                log.exception("Audio segment %s/%s failed: %s", index, total, exc)
-                yield event({"type": "error", "message": str(exc)})
-                return
-            text = clean_transcript(raw)
-            if text:
-                texts.append(text)
-            start_sec = start / 16000.0
+        job_id = uuid.uuid4().hex
+        cancel = threading.Event()
+        UPLOAD_JOBS[job_id] = cancel
+        completed = 0
+        try:
             yield event(
                 {
-                    "type": "segment",
-                    "index": index,
-                    "total": total,
-                    "start_sec": round(start_sec, 2),
-                    "end_sec": round(min(duration_sec, start_sec + len(segment) / 16000.0), 2),
-                    "text": text,
+                    "type": "start",
+                    "job_id": job_id,
+                    "duration_sec": round(duration_sec, 2),
+                    "total_segments": total,
+                    "segment_seconds": TRANSCRIBE_SEGMENT_SECONDS,
                 }
             )
-        yield event(
-            {
-                "type": "done",
-                "text": "\n".join(texts),
-                "duration_sec": round(duration_sec, 2),
-                "elapsed_seconds": round(time.time() - started_at, 2),
-                "total_segments": total,
-            }
-        )
+            texts = []
+            for index, (start, segment) in enumerate(_segments(wav), start=1):
+                if cancel.is_set():
+                    yield event({"type": "cancelled", "completed_segments": completed})
+                    return
+                try:
+                    raw = await asyncio.to_thread(_transcribe_segment, model, segment, context or "", lang_param)
+                except Exception as exc:
+                    log.exception("Audio segment %s/%s failed: %s", index, total, exc)
+                    yield event({"type": "error", "message": str(exc)})
+                    return
+                text = convert_text(clean_transcript(raw), script)
+                if text:
+                    texts.append(text)
+                start_sec = start / 16000.0
+                yield event(
+                    {
+                        "type": "segment",
+                        "index": index,
+                        "total": total,
+                        "start_sec": round(start_sec, 2),
+                        "end_sec": round(min(duration_sec, start_sec + len(segment) / 16000.0), 2),
+                        "text": text,
+                    }
+                )
+                completed = index
+            yield event(
+                {
+                    "type": "done",
+                    "text": "\n".join(texts),
+                    "duration_sec": round(duration_sec, 2),
+                    "elapsed_seconds": round(time.time() - started_at, 2),
+                    "total_segments": total,
+                }
+            )
+        finally:
+            # 用戶端中途斷線時產生器會在這裡被關閉，同樣要把工作移除
+            UPLOAD_JOBS.pop(job_id, None)
 
     return StreamingResponse(
         sse_generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/transcribe/cancel")
+async def transcribe_cancel(request: CancelRequest):
+    """停止一個進行中的 /transcribe/stream；目前這一段辨識完就停，已完成的段落保留。"""
+    cancel = UPLOAD_JOBS.get(request.job_id)
+    if cancel is None:
+        return JSONResponse(
+            {"status": "error", "message": "Transcription job is no longer active"},
+            status_code=404,
+        )
+    cancel.set()
+    return {"status": "cancelling", "job_id": request.job_id}
 
 
 def _init_stream_state(model, context: str, language: Optional[str], chunk_size_sec: float):
@@ -584,6 +630,7 @@ async def asr_stream_api_v1(websocket: WebSocket):
     try:
         context = _stream_context(header)
         language = _resolve_language(model, header.get("language"), STREAM_DEFAULT_LANGUAGE)
+        output_script = resolve_output_script(header.get("output_script"))
     except ValueError as exc:
         await send({"status": "error", "requestId": f"{request_id}", "msg": str(exc)})
         await websocket.close()
@@ -599,6 +646,7 @@ async def asr_stream_api_v1(websocket: WebSocket):
         language=language,
         vad=vad_factory.new() if use_vad else None,
         final_pass=bool(header.get("final_pass", True)),
+        output_script=output_script,
     )
 
     eos, stop = object(), object()
@@ -632,6 +680,7 @@ async def asr_stream_api_v1(websocket: WebSocket):
                 "active_connections": STATE["active_streams"],
                 "language": language or "auto",
                 "vad": use_vad,
+                "output_script": output_script,
             }
         )
         carry = b""

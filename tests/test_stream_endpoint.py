@@ -64,3 +64,76 @@ def test_unsupported_language_gets_an_error_message(client):
         reply = json.loads(ws.receive_text())
         assert reply["status"] == "error"
         assert "klingon" in reply["msg"]
+
+
+class WorkingModel(BrokenModel):
+    def transcribe(self, audio, context="", language=None, return_time_stamps=False):
+        return [SimpleNamespace(text="请问软件在哪里|")]
+
+
+@pytest.fixture
+def upload_client(monkeypatch, tmp_path):
+    import soundfile as sf
+
+    monkeypatch.setitem(main.STATE, "model", WorkingModel())
+    monkeypatch.setitem(main.STATE, "backend", "fake")
+    path = tmp_path / "a.wav"
+    sf.write(path, np.zeros(16000 * 65, dtype=np.float32), 16000)  # 65 s -> 3 segments
+    return TestClient(main.app), path
+
+
+def sse_events(response):
+    return [json.loads(line[len("data: "):]) for line in response.text.splitlines() if line.startswith("data: ")]
+
+
+def test_transcribe_output_script(upload_client):
+    client, path = upload_client
+    with open(path, "rb") as f:
+        body = client.post("/transcribe", files={"file": f}, data={"output_script": "traditional"}).json()
+    assert body["text"] == "\n".join(["請問軟體在哪裡"] * 3)
+    with open(path, "rb") as f:
+        assert client.post("/transcribe", files={"file": f}).json()["text"].startswith("请问软件")
+    with open(path, "rb") as f:
+        assert client.post("/transcribe", files={"file": f}, data={"output_script": "pinyin"}).status_code == 400
+
+
+def test_upload_stream_reports_a_job_and_cleans_it_up(upload_client):
+    client, path = upload_client
+    with open(path, "rb") as f:
+        events = sse_events(client.post("/transcribe/stream", files={"file": f}, data={"output_script": "traditional"}))
+    assert [e["type"] for e in events] == ["start", "segment", "segment", "segment", "done"]
+    assert events[0]["job_id"] and events[0]["total_segments"] == 3
+    assert events[1]["text"] == "請問軟體在哪裡"
+    assert main.UPLOAD_JOBS == {}
+
+
+def test_cancel_stops_before_the_next_segment(upload_client, monkeypatch):
+    client, path = upload_client
+    real = main._transcribe_segment
+
+    def cancel_after_first(model, segment, context, lang):
+        text = real(model, segment, context, lang)
+        (job_id,) = main.UPLOAD_JOBS
+        assert client.post("/transcribe/cancel", json={"job_id": job_id}).json()["status"] == "cancelling"
+        return text
+
+    monkeypatch.setattr(main, "_transcribe_segment", cancel_after_first)
+    with open(path, "rb") as f:
+        events = sse_events(client.post("/transcribe/stream", files={"file": f}))
+    assert [e["type"] for e in events] == ["start", "segment", "cancelled"]
+    assert events[-1]["completed_segments"] == 1
+    assert main.UPLOAD_JOBS == {}
+
+
+def test_cancel_unknown_job_is_404(upload_client):
+    client, _ = upload_client
+    assert client.post("/transcribe/cancel", json={"job_id": "nope"}).status_code == 404
+
+
+def test_stream_header_output_script_is_echoed_and_validated(client):
+    with client.websocket_connect("/asr_stream_api_v1") as ws:
+        ws.send_text(header(output_script="traditional", use_vad=False))
+        assert json.loads(ws.receive_text())["output_script"] == "traditional"
+    with client.websocket_connect("/asr_stream_api_v1") as ws:
+        ws.send_text(header(output_script="pinyin"))
+        assert json.loads(ws.receive_text())["status"] == "error"

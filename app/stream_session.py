@@ -14,6 +14,7 @@ from typing import List, Optional
 import numpy as np
 
 from infer_gate import InferGate
+from script_convert import DEFAULT_OUTPUT_SCRIPT, StreamingConverter, convert_text
 from textproc import (
     clean_transcript,
     detect_and_fix_repetitions,
@@ -71,6 +72,7 @@ class StreamSession:
         language: Optional[str] = None,
         vad: Optional[StreamVad] = None,
         final_pass: bool = True,
+        output_script: str = DEFAULT_OUTPUT_SCRIPT,
     ) -> None:
         self._model = model
         self._gate = gate
@@ -79,6 +81,8 @@ class StreamSession:
         self._language = language
         self._vad = vad
         self._final_pass = final_pass
+        self._output_script = output_script
+        self._converter = StreamingConverter(output_script)
 
         self._buf = np.zeros((0,), dtype=np.float32)
         self._preroll = np.zeros((0,), dtype=np.float32)
@@ -115,7 +119,7 @@ class StreamSession:
                 return
             chunk = np.concatenate(pending)
             pending, pending_samples = [], 0
-            msgs.append(self._wrap(self._decode_step(chunk, ended, vad_ms)))
+            msgs.append(self._wrap(self._localize(self._decode_step(chunk, ended, vad_ms))))
             vad_ms = 0.0
 
         while True:
@@ -163,11 +167,20 @@ class StreamSession:
         self._buf = np.zeros((0,), dtype=np.float32)
         if not self._in_speech or (self._state is None and tail.shape[0] == 0):
             return self._wrap({"text": "", "reset": True, "final_text": ""})
-        if tail.shape[0]:
-            self._decode(tail)
-        return self._wrap(self._close_segment(still_speaking=False))
+        first_delta = self._decode(tail) if tail.shape[0] else ""
+        return self._wrap(
+            self._localize(self._close_segment(still_speaking=False, first_delta=first_delta))
+        )
 
     # ------------------------------------------------------------ internals
+
+    def _localize(self, msg: dict) -> dict:
+        """Turn a message's text into the script the client asked for."""
+        msg["text"] = self._converter.push(msg["text"])
+        if msg.get("reset"):
+            msg["final_text"] = convert_text(msg["final_text"], self._output_script)
+            self._converter.reset()
+        return msg
 
     def _wrap(self, msg: dict) -> dict:
         return {"status": "success", "requestId": f"{self._request_id}", "msg": msg}

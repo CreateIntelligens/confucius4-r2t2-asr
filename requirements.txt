@@ -22,6 +22,7 @@ fastapi==0.118.0
 uvicorn[standard]==0.37.0
 python-multipart==0.0.20
 fireredvad==0.0.2
+opencc-python-reimplemented>=0.1.7
 # qwen_asr 的 forced aligner 在匯入時就需要，即使服務沒用到對齊功能
 nagisa
 soynlp
