@@ -27,6 +27,7 @@ from typing import Optional
 
 import librosa
 import numpy as np
+import soundfile as sf
 import torch
 from fastapi import (
     FastAPI,
@@ -230,6 +231,11 @@ def _load_model() -> None:
                 )
                 model.streaming_transcribe_no_reset(dummy_wav, state, 4)
                 model.transcribe(audio=[(dummy_wav, 16000)], language=["Chinese"])
+            # 上傳音檔的解碼與重取樣第一次呼叫要數秒初始化，先在這裡付掉，
+            # 不要讓服務啟動後的第一個請求去等。
+            with tempfile.NamedTemporaryFile(suffix=".wav") as tf:
+                sf.write(tf.name, np.zeros(48000, dtype=np.float32), 48000)
+                librosa.load(tf.name, sr=16000, mono=True)
             STATE["warmup_seconds"] = round(time.time() - t_warmup, 2)
             log.info("自動預熱完成，耗時 %.2f 秒", STATE["warmup_seconds"])
         except Exception as exc:
