@@ -25,9 +25,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-import librosa
 import numpy as np
-import soundfile as sf
 import torch
 from fastapi import (
     FastAPI,
@@ -47,6 +45,7 @@ from pydantic import BaseModel
 # Disable FlashInfer sampler to avoid nvcc JIT compilation requirement
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
+from audio_io import load_audio
 from infer_gate import InferGate
 from r2t2 import R2T2ASRModel
 from stream_session import StreamSession, unfixed_tail
@@ -231,11 +230,6 @@ def _load_model() -> None:
                 )
                 model.streaming_transcribe_no_reset(dummy_wav, state, 4)
                 model.transcribe(audio=[(dummy_wav, 16000)], language=["Chinese"])
-            # 上傳音檔的解碼與重取樣第一次呼叫要數秒初始化，先在這裡付掉，
-            # 不要讓服務啟動後的第一個請求去等。
-            with tempfile.NamedTemporaryFile(suffix=".wav") as tf:
-                sf.write(tf.name, np.zeros(48000, dtype=np.float32), 48000)
-                librosa.load(tf.name, sr=16000, mono=True)
             STATE["warmup_seconds"] = round(time.time() - t_warmup, 2)
             log.info("自動預熱完成，耗時 %.2f 秒", STATE["warmup_seconds"])
         except Exception as exc:
@@ -407,7 +401,7 @@ async def transcribe(
 
     try:
         t0 = time.time()
-        wav, _ = await asyncio.to_thread(librosa.load, tmp_path, sr=16000, mono=True)
+        wav = await asyncio.to_thread(load_audio, tmp_path)
         raw_parts, clean_parts = [], []
         for _, segment in _segments(wav):
             raw = await asyncio.to_thread(_transcribe_segment, model, segment, context or "", lang_param)
@@ -448,7 +442,7 @@ async def transcribe_stream(
     lang_param = _batch_language(model, language)
     tmp_path = await _save_upload(file)
     try:
-        wav, _ = await asyncio.to_thread(librosa.load, tmp_path, sr=16000, mono=True)
+        wav = await asyncio.to_thread(load_audio, tmp_path)
     except Exception as exc:
         log.exception("Audio decode error: %s", exc)
         raise HTTPException(status_code=400, detail="無法讀取音訊檔案，請確認檔案格式後重試。")
