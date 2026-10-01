@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir \
     "fastapi>=0.115" \
     "uvicorn[standard]>=0.32" \
     "python-multipart" \
+    "opencc-python-reimplemented>=0.1.7" \
     "websockets"
 
 WORKDIR /app

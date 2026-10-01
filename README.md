@@ -60,7 +60,8 @@
    - HTTP 狀態檢查：`GET /healthz` 或 `GET /health`
    - 即時字幕網頁介面：`GET /`
    - HTTP 一次性檔案轉寫：`POST /transcribe`
-   - HTTP SSE 模擬流式轉寫：`POST /transcribe/stream`
+   - HTTP SSE 逐段檔案轉寫：`POST /transcribe/stream`，每段完成即回傳字幕
+   - 停止指定音檔辨識：`POST /transcribe/cancel`，傳入 SSE `start` 事件的 `job_id`
    - WebSocket 串流介面：`WS /ws/stream` 與 `WS /asr_stream_api_v1`
 
 ---
@@ -73,7 +74,8 @@ confucius4-r2t2-asr/
 │   ├── main.py              # FastAPI 容器服務入口
 │   └── r2t2/                # R2T2 串流推論核心引擎模組
 ├── web/
-│   └── index.html           # 現代化即時字幕 Single Page Application (SPA)
+│   ├── index.html           # 語音辨識工作台
+│   └── assets/              # 前端樣式與互動程式
 ├── deploy/
 │   ├── systemd/
 │   │   └── confucius4-r2t2.service  # Linux 原生 Systemd 常駐守護進程配置
@@ -112,7 +114,7 @@ docker compose logs -f r2t2-api
    uv venv .venv --python 3.12
    source .venv/bin/activate
    uv pip install torch==2.9.1+cu128 --index-url https://download.pytorch.org/whl/cu128
-   uv pip install "vllm>=0.14.0" fireredvad sanic soundfile librosa
+   uv pip install "vllm>=0.14.0" fireredvad sanic soundfile librosa "opencc-python-reimplemented>=0.1.7"
    uv pip uninstall nagisa dynet38 # 排除 QEMU CPU 缺少 AVX 時的 SIGILL 崩潰
    ```
 
@@ -142,28 +144,32 @@ docker compose logs -f r2t2-api
 
 ### 模式一：HTTP REST 音訊檔案轉寫 API（適合錄音檔/一次性辨識）
 
-上傳已錄製之音訊檔案（支援 WAV、MP3、FLAC、M4A、OGG 等格式），直接回傳完整識別結果。
+上傳已錄製之音訊檔案（支援 WAV、MP3、FLAC、M4A、OGG 等格式，單檔上限 200 MB）。長音檔每 30 秒重新建立辨識狀態；`/transcribe/stream` 會逐段傳回字幕與音訊時間，前端可取消單一辨識工作。
 
 - **端點 URL**：`https://147.5gao.ai/transcribe`（或內網 `http://10.9.0.35:8040/transcribe`）
 - **HTTP 方法**：`POST`
 - **Content-Type**：`multipart/form-data`
 - **參數**：
-  - `file` (必填)：音訊二進制檔案
+  - `file` (必填)：音訊二進制檔案，最大 200 MB
   - `language` (選填)：`zhen`（中英混合）、`Chinese`（中文）、`English`（英文）
+  - `output_script` (選填)：`traditional`（繁體中文，前端預設）或 `simplified`（簡體中文；REST 呼叫預設）
   - `context` (選填)：自訂提示詞或上下文熱詞
+
+長音檔使用 `POST /transcribe/stream`。服務每 30 秒回傳一個 `segment` 事件；`start` 事件包含 `job_id`。取消時以 JSON 呼叫 `POST /transcribe/cancel`：`{"job_id":"<job_id>"}`。已完成的字幕片段會保留。
 
 #### 1. cURL 呼叫範例
 ```bash
 curl -X POST https://147.5gao.ai/transcribe \
   -F "file=@your_audio.wav" \
-  -F "language=zhen"
+  -F "language=zhen" \
+  -F "output_script=traditional"
 ```
 
 響應範例 (JSON)：
 ```json
 {
   "status": "success",
-  "text": "之前有顾客自己带酒水也没加收钱或者不让喝",
+  "text": "之前有顧客自己帶酒水也沒加收錢或者不讓喝",
   "duration_sec": 6.74,
   "cost_ms": 3773.3
 }
@@ -199,6 +205,7 @@ print(response.json())
    {
      "requestId": "488fbe6c-8fe8-442a-a925-fb355a153406",
      "language": "zhen",
+     "output_script": "traditional",
      "use_vad": true,
      "secret_key": "test0102"
    }
@@ -375,4 +382,3 @@ curl https://147.5gao.ai/health
 ## 📝 變更日誌
 
 詳細版本變更與升級歷史請參閱 [CHANGELOG.md](./CHANGELOG.md)。
-

@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **一般／深色模式與字幕工作台改版**：新增主題切換，OBS 空白狀態不再顯示無法操作的提示。
 - **長音檔逐段字幕**：新增 `POST /transcribe/stream`，每 30 秒建立獨立辨識狀態，逐段回傳字幕、音訊時間與進度。
+- **繁體中文輸出**：新增繁體／簡體選擇；繁體字幕使用 OpenCC 轉換辨識結果，即時串流與音檔轉寫皆適用。
+- **停止音檔辨識**：新增工作 ID 與取消端點，可停止目前解碼步驟後的後續分段，並保留已完成字幕。
 - **前端資產拆分**：將樣式與互動程式移至 `web/assets/app.css` 與 `web/assets/app.js`，由 Sanic `/assets` 路由提供。
 
 ### Changed

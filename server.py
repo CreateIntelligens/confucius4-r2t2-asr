@@ -14,6 +14,7 @@ import asyncio
 import logging
 import argparse
 import traceback
+import threading
 import numpy as np
 from typing import Optional
 
@@ -26,6 +27,7 @@ if CONFUCIUS_DIR not in sys.path:
 from sanic import Sanic, Request, Websocket, response
 from sanic.worker.manager import WorkerManager
 from sanic.worker.process import WorkerProcess
+from opencc import OpenCC
 
 # Common Chinese and English punctuation characters for hallucination detection
 _PUNCT_CHARS = "，。！？、；：,.!?;:~…·\"'()（）《》—-"
@@ -160,6 +162,17 @@ app.config.WEBSOCKET_PING_TIMEOUT = None
 WorkerManager.THRESHOLD = 300
 TRANSCRIBE_SEGMENT_SECONDS = 30
 TRANSCRIBE_SEGMENT_SAMPLES = TRANSCRIBE_SEGMENT_SECONDS * 16000
+TRADITIONAL_CONVERTER = OpenCC("s2twp")
+ACTIVE_TRANSCRIPTION_JOBS: dict[str, threading.Event] = {}
+ACTIVE_TRANSCRIPTION_JOBS_LOCK = threading.Lock()
+
+
+class TranscriptionCancelled(Exception):
+    pass
+
+
+def _convert_output_text(text: str, output_script: str) -> str:
+    return TRADITIONAL_CONVERTER.convert(text) if output_script == "traditional" else text
 
 YOUDAO_ONETIME_ASR_EOS_STRING = "YOUDAO_ONETIME_ASR_STREAM_EOS"
 SAMPLING_RATE = 16000
@@ -341,7 +354,13 @@ def _decode_audio_bytes(content: bytes) -> np.ndarray:
     return wav.astype(np.float32)
 
 
-def _transcribe_audio_segment(wav: np.ndarray, context: str, language: Optional[str]) -> str:
+def _transcribe_audio_segment(
+    wav: np.ndarray,
+    context: str,
+    language: Optional[str],
+    output_script: str = "simplified",
+    cancel_event: Optional[threading.Event] = None,
+) -> str:
     state = asr_model.init_streaming_state(
         context=context or "",
         language=language,
@@ -352,9 +371,13 @@ def _transcribe_audio_segment(wav: np.ndarray, context: str, language: Optional[
     step_samples = int(round(0.32 * 16000))
     max_tokens = 4
     for start in range(0, len(wav), step_samples):
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelled()
         asr_model.streaming_transcribe(wav[start : start + step_samples], state, max_tokens)
+    if cancel_event is not None and cancel_event.is_set():
+        raise TranscriptionCancelled()
     asr_model.finish_streaming_transcribe(state, max_tokens)
-    return state.text.split("|")[0].strip()
+    return _convert_output_text(state.text.split("|")[0].strip(), output_script)
 
 @app.route("/transcribe", methods=["POST"])
 async def handle_transcribe(request: Request):
@@ -371,6 +394,9 @@ async def handle_transcribe(request: Request):
 
     language = request.form.get("language", None)
     context = request.form.get("context", "")
+    output_script = request.form.get("output_script", "simplified")
+    if output_script not in ("traditional", "simplified"):
+        return response.json({"status": "error", "message": "Unsupported output script"}, status=400)
 
     try:
         wav = await asyncio.to_thread(_decode_audio_bytes, file.body)
@@ -388,7 +414,7 @@ async def handle_transcribe(request: Request):
             segment_texts = []
             for start in range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES):
                 segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
-                text = _transcribe_audio_segment(segment, context or "", lang_param)
+                text = _transcribe_audio_segment(segment, context or "", lang_param, output_script)
                 if text:
                     segment_texts.append(text)
             cost_ms = round((time.time() - t0) * 1000, 1)
@@ -406,6 +432,22 @@ async def handle_transcribe(request: Request):
         return response.json({"status": "error", "message": str(e)}, status=500)
 
 
+@app.route("/transcribe/cancel", methods=["POST"])
+async def handle_transcribe_cancel(request: Request):
+    payload = request.json or {}
+    job_id = payload.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        return response.json({"status": "error", "message": "Missing job_id"}, status=400)
+
+    with ACTIVE_TRANSCRIPTION_JOBS_LOCK:
+        cancel_event = ACTIVE_TRANSCRIPTION_JOBS.get(job_id)
+    if cancel_event is None:
+        return response.json({"status": "error", "message": "Transcription job is no longer active"}, status=404)
+
+    cancel_event.set()
+    return response.json({"status": "cancelling", "job_id": job_id})
+
+
 @app.route("/transcribe/stream", methods=["POST"])
 async def handle_transcribe_stream(request: Request):
     if asr_model is None:
@@ -417,6 +459,9 @@ async def handle_transcribe_stream(request: Request):
 
     language = request.form.get("language", None)
     context = request.form.get("context", "")
+    output_script = request.form.get("output_script", "simplified")
+    if output_script not in ("traditional", "simplified"):
+        return response.json({"status": "error", "message": "Unsupported output script"}, status=400)
     try:
         wav = await asyncio.to_thread(_decode_audio_bytes, file.body)
     except Exception as e:
@@ -441,49 +486,88 @@ async def handle_transcribe_stream(request: Request):
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     started_at = time.time()
-    await stream.send(send_event({
-        "type": "start",
-        "duration_sec": round(duration_sec, 2),
-        "total_segments": total_segments,
-        "segment_seconds": TRANSCRIBE_SEGMENT_SECONDS,
-    }))
-
+    job_id = uuid.uuid4().hex
+    cancel_event = threading.Event()
+    with ACTIVE_TRANSCRIPTION_JOBS_LOCK:
+        ACTIVE_TRANSCRIPTION_JOBS[job_id] = cancel_event
     segment_texts = []
-    for index, start in enumerate(range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES), start=1):
-        segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
+    completed_segments = 0
+
+    async def send_event_if_connected(payload: dict) -> bool:
         try:
-            text = await asyncio.to_thread(
-                _transcribe_audio_segment,
-                segment,
-                context or "",
-                lang_param,
-            )
-        except Exception as e:
-            logger.exception("Audio segment %s/%s failed: %s", index, total_segments, e)
-            await stream.send(send_event({"type": "error", "message": str(e)}))
-            await stream.eof()
+            await stream.send(send_event(payload))
+            return True
+        except Exception:
+            cancel_event.set()
+            return False
+
+    try:
+        if not await send_event_if_connected({
+            "type": "start",
+            "job_id": job_id,
+            "duration_sec": round(duration_sec, 2),
+            "total_segments": total_segments,
+            "segment_seconds": TRANSCRIBE_SEGMENT_SECONDS,
+        }):
             return
 
-        if text:
-            segment_texts.append(text)
-        start_sec = start / 16000.0
-        await stream.send(send_event({
-            "type": "segment",
-            "index": index,
-            "total": total_segments,
-            "start_sec": round(start_sec, 2),
-            "end_sec": round(min(duration_sec, start_sec + len(segment) / 16000.0), 2),
-            "text": text,
-        }))
+        for index, start in enumerate(range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES), start=1):
+            if cancel_event.is_set():
+                await send_event_if_connected({"type": "cancelled", "completed_segments": completed_segments})
+                await stream.eof()
+                return
 
-    await stream.send(send_event({
-        "type": "done",
-        "text": "\n".join(segment_texts),
-        "duration_sec": round(duration_sec, 2),
-        "elapsed_seconds": round(time.time() - started_at, 2),
-        "total_segments": total_segments,
-    }))
-    await stream.eof()
+            segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
+            try:
+                text = await asyncio.to_thread(
+                    _transcribe_audio_segment,
+                    segment,
+                    context or "",
+                    lang_param,
+                    output_script,
+                    cancel_event,
+                )
+            except TranscriptionCancelled:
+                await send_event_if_connected({"type": "cancelled", "completed_segments": completed_segments})
+                await stream.eof()
+                return
+            except Exception as e:
+                logger.exception("Audio segment %s/%s failed: %s", index, total_segments, e)
+                await send_event_if_connected({"type": "error", "message": str(e)})
+                await stream.eof()
+                return
+
+            if text:
+                segment_texts.append(text)
+            start_sec = start / 16000.0
+            if not await send_event_if_connected({
+                "type": "segment",
+                "index": index,
+                "total": total_segments,
+                "start_sec": round(start_sec, 2),
+                "end_sec": round(min(duration_sec, start_sec + len(segment) / 16000.0), 2),
+                "text": text,
+            }):
+                return
+            completed_segments = index
+
+        if cancel_event.is_set():
+            await send_event_if_connected({"type": "cancelled", "completed_segments": completed_segments})
+        else:
+            await send_event_if_connected({
+                "type": "done",
+                "text": "\n".join(segment_texts),
+                "duration_sec": round(duration_sec, 2),
+                "elapsed_seconds": round(time.time() - started_at, 2),
+                "total_segments": total_segments,
+            })
+        await stream.eof()
+    except asyncio.CancelledError:
+        cancel_event.set()
+        raise
+    finally:
+        with ACTIVE_TRANSCRIPTION_JOBS_LOCK:
+            ACTIVE_TRANSCRIPTION_JOBS.pop(job_id, None)
 
 
 # Streaming WebSocket v1
@@ -542,6 +626,9 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
             language = header.get("language", "zhen")
             if language == "zhen":
                 language = None
+            output_script = header.get("output_script", "simplified")
+            if output_script not in ("traditional", "simplified"):
+                output_script = "simplified"
             secret_key = header.get("secret_key", None)
             smooth = header.get("smooth", False)
 
@@ -603,6 +690,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                         else:
                             new_asr_text = ""
                         out_msg = {"text": new_asr_text, "reset": True}
+                        out_msg["text"] = _convert_output_text(out_msg["text"], output_script)
                         out_str = {"status": "success", "requestId": f"{requestId}", "msg": out_msg}
                         await ws.send(json.dumps(out_str, ensure_ascii=False))
                         await ws.close()
@@ -705,6 +793,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                         last_fixed_asr_text = ""
 
                     out_msg["total_cost_ms"] = round(vad_cost_ms + asr_cost_ms, 1)
+                    out_msg["text"] = _convert_output_text(out_msg.get("text", ""), output_script)
                     out_str = {"status": "success", "requestId": f"{requestId}", "msg": out_msg}
                     try:
                         await ws.send(json.dumps(out_str, ensure_ascii=False))
@@ -730,6 +819,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                     else:
                         new_asr_text = ""
                     out_msg = {"text": new_asr_text, "reset": True}
+                    out_msg["text"] = _convert_output_text(out_msg["text"], output_script)
                     asr_state = asr_model.init_streaming_state(
                         context=context,
                         language=language,
