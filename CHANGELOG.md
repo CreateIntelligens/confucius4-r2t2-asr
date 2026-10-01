@@ -19,6 +19,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **音檔容量與等待時間**：網頁單檔上限提高至 200 MB；Nginx 與 Sanic 設定同步支援大型上傳及長時間辨識。
 - **產品標題**：網頁頁籤與頁首改為 `333-R2T2-ASR`。
 
+## [1.3.0] - 2026-10-01
+
+### Added
+- **Transformers 後端也能串流**：`app/r2t2/r2t2_asr.py` 的串流解碼不再限定 vLLM，aarch64 / 顯存吃緊的主機（如 NVIDIA GB10）可直接串流。
+- **llama.cpp 後端與自動選擇**（`app/llama_backend.py`）：聲學編碼器留在 PyTorch、逐字生成交給 llama.cpp，不需要 vLLM。`ASR_BACKEND=auto` 依序嘗試 `vllm` → `llama` → `transformers`。Docker 映像在 build 時從原始碼編譯 llama.cpp，x86_64 與 aarch64 共用同一份 `Dockerfile`。
+- **`app/main.py` 提供 `WS /asr_stream_api_v1`**：與 `server.py` 相同的有道協議（JSON header、PCM、`YOUDAO_ONETIME_ASR_STREAM_EOS`），支援 VAD 斷句、熱詞（`system_prompt`）、`smooth`。
+- **句末 `final_text`**：每句結束（`reset: true`）時整句重新辨識一次，修正串流邊聽邊出字造成的句首雜字與誤判；header 可用 `final_pass: false` 關閉。
+- **`/healthz` 回報推論狀態**：`inference`（排隊數、目前推論已跑多久、上次成功距今多久）、`active_streams`、`vad_loaded`；推論卡住超過 `STALL_SECONDS` 時 `status` 變為 `stalled`。`server.py` 的 `/health` 同步加入，卡住時回 503。
+- 環境變數 `VAD_DIR`、`STREAM_DEFAULT_LANGUAGE`、`STREAM_SECRET_KEYS`、`STALL_SECONDS`。
+- `tests/`（pytest）：語言對應、排隊鎖、串流 session、滑動視窗裁切，以及兩套服務、README、網頁之間的協議一致性檢查。
+- `deploy/systemd/confucius-r2t2.user.service`：GB10 上以 systemd user unit 執行 `app/main.py` 的設定。
+
+### Changed
+- **所有模型呼叫共用一個排隊鎖並在執行緒中執行**（`app/main.py` 與 `server.py`）：多路串流與批次請求輪流推論，不再阻塞事件迴圈。
+- **每條連線獨立的 VAD 狀態**：只共用模型權重。有 VAD 時偵測到語音才開始解碼，靜音不佔 GPU。
+- **推論落後時自動併塊**：一步最多處理 1.28 秒音訊；滑動視窗改以實際樣本數裁切，分塊大小可變。
+- **串流預設語言由自動判斷改為 Chinese**：`zhen`（中英混講）對應成 Chinese，夾雜的英文照實輸出；要自動判斷須明確送 `auto`。網頁語言選單同步調整。
+- `/transcribe`、`/transcribe/stream`、`/ws/stream` 接受相同的語言代碼（`zhen`、`zh`、`en`…），不支援的語言回 400 而非 500。
+- `/transcribe` 的 `text` 去除模型輸出的 `|` 標記。
+- **`app/main.py` 跟上新版網頁**：提供 `/assets`、`POST /transcribe/stream` 改為與 `server.py` 相同的逐段事件（`start`／`segment`／`done`），`/transcribe` 同樣每 30 秒分段並補上 `duration_sec`、`cost_ms` 欄位。原本的 token 增量 SSE 已移除。
+- `server.py` 的 `/transcribe`、`/transcribe/stream` 每一步解碼都經過排隊鎖。
+- 網頁在句末採用 `final_text` 歸檔。
+- **Docker 映像改為 `builder` → `runner` 兩階段、以 `nvidia/cuda:13.0.3-cudnn-runtime` 為底**：原本的 `pytorch/pytorch` 基底只有 amd64，在 aarch64 的 GB10 上無法使用。相依套件改由 `requirements.txt` 加本機 `wheels/` 安裝，不含 vLLM；GPU 改用 CDI 掛載；模型改掛宿主目錄（`MODEL_HOST_DIR`、`VAD_HOST_DIR`）；容器以宿主帳號執行。
+
+### Fixed
+- **llama.cpp 原生擴充在多路並行時讀到損毀的 embedding**（`native_ext.cpp`）：放掉 GIL 之後才讀取 numpy 陣列，其他 Python 執行緒活動時會出現 `cannot create std::vector larger than max_size()` 或 segfault。
+- **高負載併塊時可能吞掉一整句**：VAD 改為永遠逐塊執行，只合併解碼。
+- **`server.py` 的 `POST /transcribe` 同時請求會讓服務卡死**：多個執行緒同時呼叫同一個 vLLM 引擎。現在與串流共用排隊鎖，且每一步解碼之間會讓出鎖，長音檔不會讓串流停擺。
+- **README 與範例腳本的串流結束字串寫錯**（寫成小寫的 `youdao_onetime_asr_eos_string`，伺服器不認得）。
+- **`server.py` 同時多路串流互相卡住**：推論原本直接在事件迴圈上同步執行，且多條連線共用同一個 VAD 實例，導致多數句子等不到 `reset`。
+- **自動語言模式串流停在第一個字**：模型回 `language None` 時語言標籤沒有帶回前綴，每一步都把 token 額度花在重寫標籤上。
+- **串流不指定語言時漂到其他語言**（帶口音的華語被轉成葡萄牙文）。
+- `/ws/stream` 結束時未送出 close frame。
+
+### Known gaps
+- `server.py` 的修改尚未在 vLLM 主機上實測；本次只在 GB10（Transformers 後端）驗證了 `app/main.py`。
+- `server.py` 沒有 `final_text`。
 ## [1.2.0] - 2026-09-30
 
 ### Added

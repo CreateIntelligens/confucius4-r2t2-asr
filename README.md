@@ -61,7 +61,13 @@
    - 即時字幕網頁介面：`GET /`
    - HTTP 一次性檔案轉寫：`POST /transcribe`
    - HTTP SSE 模擬流式轉寫：`POST /transcribe/stream`
-   - WebSocket 串流介面：`WS /ws/stream` 與 `WS /asr_stream_api_v1`
+   - WebSocket 串流介面：`WS /asr_stream_api_v1`（VAD 斷句、熱詞）與 `WS /ws/stream`（精簡版）
+
+5. **兩種後端都能串流、可同時多路**：
+   - 串流不再限定 vLLM：`app/main.py` 在 Transformers 後端（例如 aarch64 的 NVIDIA GB10）同樣提供 `/asr_stream_api_v1`。
+   - 所有模型呼叫（批次與串流）共用同一個排隊鎖並在執行緒中執行，多路連線互相輪流、不會卡死事件迴圈；推論落後時自動併塊追進度。
+   - 每條連線有獨立的 VAD 狀態；偵測到語音才開始解碼，靜音不佔 GPU。
+   - 每句結束時附上整句重新辨識的 `final_text`，修正串流邊聽邊出字造成的句首雜字與同音誤判。
 
 ---
 
@@ -71,7 +77,12 @@
 confucius4-r2t2-asr/
 ├── app/
 │   ├── main.py              # FastAPI 容器服務入口
+│   ├── stream_session.py    # 單一串流的狀態機（VAD 斷句、增量解碼、句末重辨識）
+│   ├── infer_gate.py        # 模型呼叫排隊鎖與推論狀態
+│   ├── vad.py               # 每條連線獨立的串流 VAD
+│   ├── textproc.py          # 語言代碼對應與文字清理
 │   └── r2t2/                # R2T2 串流推論核心引擎模組
+├── tests/                   # pytest
 ├── web/
 │   └── index.html           # 現代化即時字幕 Single Page Application (SPA)
 ├── deploy/
@@ -81,6 +92,7 @@ confucius4-r2t2-asr/
 │       └── 147.5gao.ai.conf # Nginx SSL + WSS 反向代理範例配置
 ├── compose.yaml             # Docker Compose 雙容器編排 (API + Nginx)
 ├── Dockerfile               # 跨架構 CUDA 容器構建檔
+├── requirements.txt         # 容器映像的相依套件（不含 vLLM）
 ├── nginx.template           # 容器版 Nginx 模板
 ├── server.py                # Sanic + vLLM 專用高效能串流服務端
 └── README.md
@@ -92,13 +104,28 @@ confucius4-r2t2-asr/
 
 ### 方法 A：Docker Compose 容器化部署（推薦）
 
+映像跑的是 `app/main.py`，內含 llama.cpp 與 Transformers 兩種後端，x86_64 與 aarch64（NVIDIA GB10）用同一份 `Dockerfile` build。啟動時自動選用（`ASR_BACKEND=auto`）：有編好的 llama.cpp 與 GGUF 模型就用 llama.cpp，否則退回 Transformers。llama.cpp 是在 build 時從原始碼編的，不依賴任何平台專屬的預編譯套件；映像不含 vLLM。
+
 ```bash
-# 啟動容器
-docker compose up -d --build
+# 1. 相依套件約 3 GB，先下到 wheels/；Dockerfile 只讀這個目錄，不連網
+#    （Python 版本要與映像相同，所以在 python:3.10 容器裡下載）
+docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp -v $PWD:/p python:3.10-slim \
+  pip download -r /p/requirements.txt setuptools wheel -d /p/wheels \
+    --extra-index-url https://download.pytorch.org/whl/cu130
+
+# 2. build 與啟動分開做；build 很吃磁碟 I/O，一次只跑一個
+docker compose build r2t2-api
+docker compose up -d
 
 # 觀察啟動日誌與自動預熱
 docker compose logs -f r2t2-api
 ```
+
+- 模型放在宿主目錄，由 `.env` 的 `MODEL_HOST_DIR`、`VAD_HOST_DIR`、`GGUF_HOST_DIR` 指定（預設 `./models/...`）；目錄是空的且 `AUTO_DOWNLOAD=1` 時會自動下載（ASR 約 4 GB、GGUF 約 2.4 GB、VAD 約 2 MB）。
+- 第一次 build 會拉 CUDA devel 映像（約 7 GB）並編譯 llama.cpp（GB10 上約 10 分鐘）。不需要 llama.cpp 時加 `WITH_LLAMA=0`（`.env` 或 `--build-arg`）跳過，服務會改用 Transformers。
+- `app/` 與 `web/` 以唯讀方式掛進容器，改了程式只要 `docker compose restart r2t2-api`，不必重 build；改 `requirements.txt` 才需要。
+- GPU 以 CDI 模式掛載（`/var/run/cdi/nvidia.yaml`）。主機若只有 legacy nvidia runtime，把 `compose.yaml` 的 `driver: cdi` 與 `device_ids` 改成 `driver: nvidia`、`count: all`。
+- 容器以宿主帳號執行（`HOST_UID`／`HOST_GID`，預設 1000）。
 
 - 容器將對外服務於 `:8803`（可於 `.env` 中調整 `PUBLIC_PORT`）。
 - 打開瀏覽器訪問 `http://<主機IP>:8803/` 即可進入**即時字幕操作介面**。
@@ -113,6 +140,8 @@ docker compose logs -f r2t2-api
    source .venv/bin/activate
    uv pip install torch==2.9.1+cu128 --index-url https://download.pytorch.org/whl/cu128
    uv pip install "vllm>=0.14.0" fireredvad sanic soundfile librosa
+   # 不用 vLLM（例如 aarch64 / 顯存吃緊）改跑 app/main.py 時：
+   # uv pip install "transformers>=4.51.0" fireredvad "fastapi>=0.115" "uvicorn[standard]" python-multipart
    uv pip uninstall nagisa dynet38 # 排除 QEMU CPU 缺少 AVX 時的 SIGILL 崩潰
    ```
 
@@ -220,7 +249,7 @@ print(response.json())
    > 說明：
    > - `msg.text`：本次 Chunk **新增之確認文字（增量 Delta）**，靜音時為空字串，前端直接累加即可。
    > - `msg.reset`：當說話人停頓（約 700ms）時觸發 VAD 斷句，回傳 `true`，代表當前句子結束，客戶端可進行換行存檔並重置當前句暫存。
-5. **結束傳輸**：發送結束字串 `"youdao_onetime_asr_eos_string"` 或主動關閉連線。
+5. **結束傳輸**：發送結束字串 `"YOUDAO_ONETIME_ASR_STREAM_EOS"` 或主動關閉連線。
 
 #### 1. Python 完整即時串流呼叫腳本
 專案已提供可直接執行的示範腳本：[`examples/client_stream_demo.py`](./examples/client_stream_demo.py)
@@ -272,7 +301,7 @@ async def run_asr_stream():
                 await ws.send(chunk)
                 await asyncio.sleep(0.16)
 
-        await ws.send("youdao_onetime_asr_eos_string")
+        await ws.send("YOUDAO_ONETIME_ASR_STREAM_EOS")
         await asyncio.sleep(1.0)
         recv_task.cancel()
 
@@ -301,7 +330,7 @@ ws.on('open', () => {
     ws.send(chunk);
   });
   stream.on('end', () => {
-    ws.send('youdao_onetime_asr_eos_string');
+    ws.send('YOUDAO_ONETIME_ASR_STREAM_EOS');
   });
 });
 
@@ -335,9 +364,88 @@ curl https://147.5gao.ai/health
   "service": "Confucius4-R2T2",
   "active_connections": 0,
   "gpu_mem_util": "0.40",
-  "model_loaded": true
+  "model_loaded": true,
+  "inference": {
+    "waiting": 0,
+    "busy_seconds": 0.0,
+    "last_success_seconds_ago": 0.18,
+    "max_wait_seconds": 1.834
+  }
 }
 ```
+`inference` 反映模型是否真的在動：`busy_seconds` 是目前這次推論已經跑了多久，超過 60 秒時 `status` 會變成 `stalled`（`server.py` 同時回 HTTP 503）；`waiting` 是正在排隊的呼叫數。
+
+`app/main.py` 的 `GET /healthz` 另外回報 `backend`、`arch`、`gpu`、`vram_used_gb`、`streaming`、`vad_loaded`、`active_streams`，正常時 `status` 為 `ok`、載入中為 `loading`。
+
+### `app/main.py` 的串流協議細節 (`WS /asr_stream_api_v1`)
+以下是 `app/main.py`（容器／GB10 部署，預設 `:8803`）的行為；`server.py` 用同一協議，差異列在最後。
+- **握手訊息 (JSON Header)**：
+  ```json
+  {
+    "requestId": "uuid-here",
+    "language": "zhen",
+    "use_vad": true,
+    "secret_key": "test0102",
+    "system_prompt": "鶴記企業、沉水泵、EUBL",
+    "final_pass": true
+  }
+  ```
+  | 欄位 | 必填 | 說明 |
+  | :--- | :--- | :--- |
+  | `requestId` | 是 | 任意識別字串，回應會原樣帶回 |
+  | `secret_key` | 是 | 需在 `STREAM_SECRET_KEYS` 內，否則以 4401 關閉連線 |
+  | `language` | 否 | `zhen`（中英混講，預設）、`zh`、`en`、`Chinese`、`English`、`Cantonese`… 或 `auto`。`zhen` 會以 Chinese 解碼，夾雜的英文仍會照實輸出；`auto` 由模型自行判斷，短句容易判錯語言，不建議 |
+  | `use_vad` | 否 | 預設 `true`，以 VAD 自動斷句 |
+  | `system_prompt` | 否 | 熱詞或上下文提示，最多 4000 字 |
+  | `smooth` | 否 | `true` 時要求模型輸出較通順的文字 |
+  | `final_pass` | 否 | 預設 `true`，句末整句重新辨識並放在 `final_text` |
+
+  握手成功後伺服器回 `{"status": "connected", "language": "Chinese", "vad": true, ...}`；header 有誤則回 `{"status": "error", "msg": "..."}` 並關閉連線。
+- **音訊傳輸 (Binary Chunks)**：
+  客戶端每 160ms 發送 16kHz 16-bit Mono PCM raw binary（5,120 bytes / 2,560 samples）。
+- **服務端即時響應 (JSON)**：
+  ```json
+  {
+    "status": "success",
+    "requestId": "uuid-here",
+    "msg": {
+      "text": "即時辨識新增字詞",
+      "reset": false,
+      "asr_cost_ms": 32.5,
+      "total_cost_ms": 35.1
+    }
+  }
+  ```
+  `text` 是只增不改的新增文字，同一句內依序串接即可。當說話者停頓約 0.6 秒時，VAD 判定語句結束，回傳句末訊息：
+  ```json
+  {
+    "status": "success",
+    "requestId": "uuid-here",
+    "msg": {
+      "text": "",
+      "reset": true,
+      "final_text": "整句重新辨識後的文字",
+      "final_pass": true,
+      "asr_cost_ms": 310.2,
+      "total_cost_ms": 314.9
+    }
+  }
+  ```
+  **請以 `final_text` 作為這一句的定稿。** 串流是邊聽邊出字，已送出的字無法收回，句首偶爾會多出雜字或聽錯同音字；`final_text` 是整句聽完後一次辨識的結果；若一次辨識漏掉串流已經送出的句尾，會自動接回。`final_pass` 為 `false` 表示這句沒有重新辨識（單句超過 30 秒、或因重複幻覺被強制斷句），此時 `final_text` 就是串流累積的文字。
+- **結束串流**：
+  送出文字訊息 `YOUDAO_ONETIME_ASR_STREAM_EOS`（全大寫，原樣送出，不是 JSON）。伺服器會回最後一則 `reset: true` 訊息後關閉連線。連續 120 秒沒有收到資料也會關閉。
+- **同時多路**：
+  多條連線共用一個模型、輪流推論。Transformers 後端在 GB10 上單路每步約 0.1 秒；三路同時講話時斷句約晚 0.3–1.7 秒，五路約晚 1.4–3.3 秒（2026-10-01 實測，每路都在同一時間講話的最壞情況）。
+- `server.py`（Sanic + vLLM 專用）提供同一協議，但沒有 `final_text`。
+
+### `app/main.py` 的一次性轉寫 (`POST /transcribe`)
+```bash
+curl -F file=@audio.wav -F language=zhen -F context="鶴記企業、沉水泵" http://localhost:8803/transcribe
+```
+`language` 可省略（自動判斷）或使用與串流相同的代碼；不支援的語言回 400。回應的 `text` 已去除模型的斷句標記 `|` 與重複幻覺，若與原始輸出不同，原文放在 `raw_text`。超過 30 秒的音檔每 30 秒切一段各自辨識，各段以換行串接。回應同時帶有 `server.py` 的欄位名稱（`duration_sec`、`cost_ms`），兩套服務的用戶端可以共用。
+
+### 長音檔逐段辨識 (`POST /transcribe/stream`)
+`app/main.py` 與 `server.py` 回傳相同的 Server-Sent Events：先一則 `start`（`duration_sec`、`total_segments`、`segment_seconds`），每辨識完 30 秒回一則 `segment`（`index`、`total`、`start_sec`、`end_sec`、`text`），最後一則 `done`（全文 `text`）；失敗時回 `error`。網頁的上傳進度就是讀這些事件。
 
 ---
 
@@ -346,11 +454,21 @@ curl https://147.5gao.ai/health
 | 變數名稱 | 預設值 | 說明 |
 | :--- | :--- | :--- |
 | `PUBLIC_PORT` | `8803` | 對外公開監聽端口（Nginx Reverse Proxy） |
-| `ASR_BACKEND` | `auto` | 後端推論引擎：`auto` (優先 vLLM，失敗自動降級 Transformers) / `vllm` / `transformers` |
+| `ASR_BACKEND` | `auto` | 後端推論引擎：`auto`（依序嘗試 `vllm` → `llama` → `transformers`，哪個在這台裝置起得來就用哪個）或指定其中之一；指定的後端起不來時服務回報錯誤，不會偷偷換別的 |
 | `AUTO_DOWNLOAD` | `1` | 若 `/model` 權重不存在，自動自 Hugging Face 下載 |
 | `AUTO_WARMUP` | `1` | 服務啟動後自動以 1 秒靜音推論預熱 CUDA kernel 與注意力快取 |
 | `GPU_MEMORY_UTILIZATION` | `0.40` | vLLM 顯存分配佔比（留有充裕 KV cache，避免 OOM） |
 | `VLLM_USE_FLASHINFER_SAMPLER` | `0` | 設為 `0` 避開缺少 nvcc 時 FlashInfer sampling 之 JIT 編譯需求 |
+| `VAD_DIR` | `$MODEL_DIR/FireRedVAD` | 串流 VAD 模型目錄（容器內固定為 `/vad`）；不存在且 `AUTO_DOWNLOAD=1` 時自動下載。載入失敗時串流照常運作但不自動斷句 |
+| `MODEL_HOST_DIR` | `./models/Confucius4-R2T2` | 掛進容器 `/model` 的宿主目錄（僅 compose） |
+| `GGUF_DIR` | `$MODEL_DIR/gguf` | llama.cpp 後端的 GGUF 目錄（容器內固定為 `/gguf`），需剛好一個解碼器 `.gguf` 與一個 `mmproj` `.gguf` |
+| `GGUF_HOST_DIR` | `./models/Confucius4-R2T2-GGUF` | 掛進容器 `/gguf` 的宿主目錄（僅 compose） |
+| `WITH_LLAMA` | `1` | build 時是否編譯 llama.cpp 後端（僅 compose build） |
+| `VLLM_MAX_MODEL_LEN` | `2048` | vLLM 後端的最大序列長度 |
+| `VAD_HOST_DIR` | `./models/FireRedVAD` | 掛進容器 `/vad` 的宿主目錄（僅 compose） |
+| `STREAM_DEFAULT_LANGUAGE` | `zhen` | 串流 header 沒帶 `language` 時的預設值 |
+| `STREAM_SECRET_KEYS` | `test0102` | 串流允許的 `secret_key`，逗號分隔 |
+| `STALL_SECONDS` | `60` | 單次推論超過此秒數，`/healthz` 回報 `stalled` |
 
 ---
 

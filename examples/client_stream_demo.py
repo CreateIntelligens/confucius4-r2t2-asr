@@ -20,7 +20,7 @@ except ImportError:
     print("請先安裝 websockets: pip install websockets")
     sys.exit(1)
 
-YOUDAO_ONETIME_ASR_EOS_STRING = "youdao_onetime_asr_eos_string"
+YOUDAO_ONETIME_ASR_EOS_STRING = "YOUDAO_ONETIME_ASR_STREAM_EOS"
 
 async def stream_audio_file(ws_url: str, wav_path: str, secret_key: str = "test0102", language: str = "zhen"):
     # 設定 SSL 忽略自主簽名（若使用標準憑證可省略）

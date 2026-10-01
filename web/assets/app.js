@@ -447,8 +447,10 @@ async function startRecording() {
             captionBox.innerHTML = `${escapeHtml(currentSegmentText)}<span class="incremental"></span>`;
           }
 
-          if (reset && currentSegmentText.trim()) {
-            commitHistorySegment(currentSegmentText);
+          // 句末伺服器會附上整句重新辨識的 final_text，比逐字累積的結果準，有就用它。
+          const segmentText = (reset && data.msg.final_text) || currentSegmentText;
+          if (reset && segmentText.trim()) {
+            commitHistorySegment(segmentText);
             currentSegmentText = "";
             captionBox.innerHTML = '<span class="caption-empty">聆聽中...</span>';
           }
