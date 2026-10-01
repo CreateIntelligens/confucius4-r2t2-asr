@@ -15,6 +15,7 @@ import logging
 import argparse
 import traceback
 import numpy as np
+from typing import Optional
 
 # Ensure local package is importable
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -151,9 +152,14 @@ logger.propagate = False
 Sanic.START_METHOD_SET = True
 Sanic.start_method = "fork"
 app = Sanic("confucius4_r2t2_server")
+app.config.REQUEST_MAX_SIZE = 205_000_000
+app.config.REQUEST_TIMEOUT = 1800
+app.config.RESPONSE_TIMEOUT = 1800
 app.config.WEBSOCKET_PING_INTERVAL = None
 app.config.WEBSOCKET_PING_TIMEOUT = None
 WorkerManager.THRESHOLD = 300
+TRANSCRIBE_SEGMENT_SECONDS = 30
+TRANSCRIBE_SEGMENT_SAMPLES = TRANSCRIBE_SEGMENT_SECONDS * 16000
 
 YOUDAO_ONETIME_ASR_EOS_STRING = "YOUDAO_ONETIME_ASR_STREAM_EOS"
 SAMPLING_RATE = 16000
@@ -296,6 +302,7 @@ secret_key_list = ["test0102"]
 
 # Static Web UI routes
 WEB_DIR = os.path.join(CURRENT_DIR, "web")
+app.static("/assets", os.path.join(WEB_DIR, "assets"), name="web_assets")
 
 @app.route("/")
 async def handle_index(request: Request):
@@ -314,6 +321,41 @@ async def handle_health(request: Request):
         "model_loaded": asr_model is not None
     })
 
+
+def _decode_audio_bytes(content: bytes) -> np.ndarray:
+    import io
+    import soundfile as sf
+    import librosa
+
+    audio_bytes = io.BytesIO(content)
+    try:
+        wav, sr = sf.read(audio_bytes)
+    except Exception:
+        audio_bytes.seek(0)
+        wav, sr = librosa.load(audio_bytes, sr=None, mono=True)
+
+    if wav.ndim > 1:
+        wav = np.mean(wav, axis=1)
+    if sr != 16000:
+        wav = librosa.resample(wav.astype(np.float32), orig_sr=sr, target_sr=16000)
+    return wav.astype(np.float32)
+
+
+def _transcribe_audio_segment(wav: np.ndarray, context: str, language: Optional[str]) -> str:
+    state = asr_model.init_streaming_state(
+        context=context or "",
+        language=language,
+        unfixed_chunk_num=0,
+        unfixed_token_num=UNFIX_TOKEN_NUM,
+        chunk_size_sec=0.32,
+    )
+    step_samples = int(round(0.32 * 16000))
+    max_tokens = 4
+    for start in range(0, len(wav), step_samples):
+        asr_model.streaming_transcribe(wav[start : start + step_samples], state, max_tokens)
+    asr_model.finish_streaming_transcribe(state, max_tokens)
+    return state.text.split("|")[0].strip()
+
 @app.route("/transcribe", methods=["POST"])
 async def handle_transcribe(request: Request):
     """
@@ -331,30 +373,11 @@ async def handle_transcribe(request: Request):
     context = request.form.get("context", "")
 
     try:
-        import io
-        import soundfile as sf
-        import librosa
-
-        audio_bytes = io.BytesIO(file.body)
-        try:
-            wav, sr = sf.read(audio_bytes)
-        except Exception:
-            audio_bytes.seek(0)
-            wav, sr = librosa.load(audio_bytes, sr=None, mono=True)
-
-        if wav.ndim > 1:
-            wav = np.mean(wav, axis=1)
-        if sr != 16000:
-            wav = librosa.resample(wav.astype(np.float32), orig_sr=sr, target_sr=16000)
-        else:
-            wav = wav.astype(np.float32)
-
+        wav = await asyncio.to_thread(_decode_audio_bytes, file.body)
         duration_sec = round(len(wav) / 16000.0, 2)
 
         def run_infer():
             t0 = time.time()
-            step_samples = 2560
-            lookahead_samples = 2560
             lang_param = None
             if language:
                 if language.lower() in ("chinese", "zh", "zhen"):
@@ -362,29 +385,14 @@ async def handle_transcribe(request: Request):
                 elif language.lower() in ("english", "en"):
                     lang_param = "English"
 
-            state = asr_model.init_streaming_state(
-                context=context or "",
-                language=lang_param,
-                unfixed_chunk_num=0,
-                unfixed_token_num=UNFIX_TOKEN_NUM,
-                chunk_size_sec=0.32,
-            )
-            pos = 0
-            is_first = True
-            max_tokens = 4
-            while pos < len(wav):
-                if is_first:
-                    seg = wav[pos : pos + step_samples + lookahead_samples]
-                    is_first = False
-                else:
-                    seg = wav[pos : pos + step_samples]
-                pos += len(seg)
-                if len(seg) > 0:
-                    asr_model.streaming_transcribe(seg, state, max_tokens)
-            asr_model.finish_streaming_transcribe(state, max_tokens)
-            text = state.text.split("|")[0].strip()
+            segment_texts = []
+            for start in range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES):
+                segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
+                text = _transcribe_audio_segment(segment, context or "", lang_param)
+                if text:
+                    segment_texts.append(text)
             cost_ms = round((time.time() - t0) * 1000, 1)
-            return text, cost_ms
+            return "\n".join(segment_texts), cost_ms
 
         text, cost_ms = await asyncio.to_thread(run_infer)
         return response.json({
@@ -396,6 +404,86 @@ async def handle_transcribe(request: Request):
     except Exception as e:
         logger.exception(f"Transcribe error: {e}")
         return response.json({"status": "error", "message": str(e)}, status=500)
+
+
+@app.route("/transcribe/stream", methods=["POST"])
+async def handle_transcribe_stream(request: Request):
+    if asr_model is None:
+        return response.json({"status": "error", "message": "Model not loaded"}, status=503)
+
+    file = request.files.get("file")
+    if not file:
+        return response.json({"status": "error", "message": "Missing 'file' field in multipart/form-data"}, status=400)
+
+    language = request.form.get("language", None)
+    context = request.form.get("context", "")
+    try:
+        wav = await asyncio.to_thread(_decode_audio_bytes, file.body)
+    except Exception as e:
+        logger.exception(f"Audio decode error: {e}")
+        return response.json({"status": "error", "message": "無法讀取音訊檔案，請確認檔案格式後重試。"}, status=400)
+
+    lang_param = None
+    if language:
+        if language.lower() in ("chinese", "zh", "zhen"):
+            lang_param = "Chinese"
+        elif language.lower() in ("english", "en"):
+            lang_param = "English"
+
+    duration_sec = len(wav) / 16000.0
+    total_segments = max(1, (len(wav) + TRANSCRIBE_SEGMENT_SAMPLES - 1) // TRANSCRIBE_SEGMENT_SAMPLES)
+    stream = await request.respond(
+        content_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+    def send_event(payload: dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    started_at = time.time()
+    await stream.send(send_event({
+        "type": "start",
+        "duration_sec": round(duration_sec, 2),
+        "total_segments": total_segments,
+        "segment_seconds": TRANSCRIBE_SEGMENT_SECONDS,
+    }))
+
+    segment_texts = []
+    for index, start in enumerate(range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES), start=1):
+        segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
+        try:
+            text = await asyncio.to_thread(
+                _transcribe_audio_segment,
+                segment,
+                context or "",
+                lang_param,
+            )
+        except Exception as e:
+            logger.exception("Audio segment %s/%s failed: %s", index, total_segments, e)
+            await stream.send(send_event({"type": "error", "message": str(e)}))
+            await stream.eof()
+            return
+
+        if text:
+            segment_texts.append(text)
+        start_sec = start / 16000.0
+        await stream.send(send_event({
+            "type": "segment",
+            "index": index,
+            "total": total_segments,
+            "start_sec": round(start_sec, 2),
+            "end_sec": round(min(duration_sec, start_sec + len(segment) / 16000.0), 2),
+            "text": text,
+        }))
+
+    await stream.send(send_event({
+        "type": "done",
+        "text": "\n".join(segment_texts),
+        "duration_sec": round(duration_sec, 2),
+        "elapsed_seconds": round(time.time() - started_at, 2),
+        "total_segments": total_segments,
+    }))
+    await stream.eof()
 
 
 # Streaming WebSocket v1

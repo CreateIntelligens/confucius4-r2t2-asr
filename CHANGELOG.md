@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+- **一般／深色模式與字幕工作台改版**：新增主題切換，OBS 空白狀態不再顯示無法操作的提示。
+- **長音檔逐段字幕**：新增 `POST /transcribe/stream`，每 30 秒建立獨立辨識狀態，逐段回傳字幕、音訊時間與進度。
+- **前端資產拆分**：將樣式與互動程式移至 `web/assets/app.css` 與 `web/assets/app.js`，由 Sanic `/assets` 路由提供。
+
+### Changed
+- **長音檔上下文管理**：`POST /transcribe` 與串流上傳流程改為每 30 秒重設辨識狀態，避免整段音檔累積超過模型 token 上限。
+- **音檔容量與等待時間**：網頁單檔上限提高至 200 MB；Nginx 與 Sanic 設定同步支援大型上傳及長時間辨識。
+- **產品標題**：網頁頁籤與頁首改為 `333-R2T2-ASR`。
+
 ## [1.2.0] - 2026-09-30
 
 ### Added
