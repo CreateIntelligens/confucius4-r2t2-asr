@@ -21,12 +21,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir pybind11
 
-COPY app/r2t2_llama/CMakeLists.txt app/r2t2_llama/native_ext.cpp /src/r2t2_llama/
+# 分兩層：llama.cpp 本體編一次要十幾分鐘到近一小時，而我們自己的 native_ext.cpp
+# 才是會改的檔案。先用空檔案把 llama.cpp 編完並快取，之後改擴充只重編最後一層。
+COPY app/r2t2_llama/CMakeLists.txt /src/r2t2_llama/
 # GGML_NATIVE=OFF：不針對 build 這台的 CPU 最佳化，映像搬到同架構的別台也能跑；
 # 運算都在 GPU 上，CPU 指令集對速度沒有影響。
-RUN mkdir -p /opt/r2t2_native/lib \
-    && if [ "$WITH_LLAMA" = "1" ]; then \
-        git init -q /src/llama.cpp \
+RUN if [ "$WITH_LLAMA" = "1" ]; then \
+        touch /src/r2t2_llama/native_ext.cpp \
+        && git init -q /src/llama.cpp \
         && git -C /src/llama.cpp fetch -q --depth 1 https://github.com/ggml-org/llama.cpp "$LLAMA_CPP_COMMIT" \
         && git -C /src/llama.cpp checkout -q FETCH_HEAD \
         && cmake -S /src/r2t2_llama -B /build \
@@ -34,7 +36,13 @@ RUN mkdir -p /opt/r2t2_native/lib \
             -DGGML_CUDA=ON -DGGML_NATIVE=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             -Dpybind11_DIR="$(python3 -m pybind11 --cmakedir)" \
-        && cmake --build /build -j 8 \
+        && cmake --build /build -j 8 --target llama mtmd ; \
+    fi
+
+COPY app/r2t2_llama/native_ext.cpp /src/r2t2_llama/
+RUN mkdir -p /opt/r2t2_native/lib \
+    && if [ "$WITH_LLAMA" = "1" ]; then \
+        cmake --build /build -j 8 --target qwen3asr_native \
         && cp /src/r2t2_llama/native/qwen3asr_native*.so /opt/r2t2_native/ \
         && cp -a /build/bin/lib*.so* /opt/r2t2_native/lib/ ; \
     fi

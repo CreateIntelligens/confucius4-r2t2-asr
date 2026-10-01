@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **llama.cpp 原生擴充在多路並行時讀到損毀的 embedding**（`native_ext.cpp`）：放掉 GIL 之後才讀取 numpy 陣列，其他 Python 執行緒活動時會出現 `cannot create std::vector larger than max_size()` 或 segfault。
 - **高負載併塊時可能吞掉一整句**：VAD 改為永遠逐塊執行，只合併解碼。
+- **llama.cpp 後端遇到被拆成多個 token 的字（如「絞」）時整條串流被關閉**：生成長度剛好切在字的中間時，原生擴充把不完整的 UTF-8 轉成字串會直接出錯。改為寬鬆轉換，與其他後端一致。
+- **串流推論出錯時用戶端分不出是錯誤還是正常結束**：現在先送 `status: "error"` 訊息，再以關閉碼 1011 結束。
 - **`server.py` 的 `POST /transcribe` 同時請求會讓服務卡死**：多個執行緒同時呼叫同一個 vLLM 引擎。現在與串流共用排隊鎖，且每一步解碼之間會讓出鎖，長音檔不會讓串流停擺。
 - **README 與範例腳本的串流結束字串寫錯**（寫成小寫的 `youdao_onetime_asr_eos_string`，伺服器不認得）。
 - **`server.py` 同時多路串流互相卡住**：推論原本直接在事件迴圈上同步執行，且多條連線共用同一個 VAD 實例，導致多數句子等不到 `reset`。

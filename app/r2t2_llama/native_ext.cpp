@@ -145,6 +145,20 @@ std::string detokenize(const llama_vocab * vocab, const std::vector<llama_token>
     return result;
 }
 
+// A token budget can end in the middle of a multi-byte character (rare
+// characters span several tokens). pybind's default std::string conversion is
+// strict UTF-8 and raises on that, which killed the stream. Decode leniently
+// instead: the incomplete tail becomes U+FFFD, exactly what the other
+// backends' tokenizers produce and what the streaming code already strips.
+py::str utf8_lossy(const std::string & text) {
+    PyObject * decoded = PyUnicode_DecodeUTF8(
+            text.data(), static_cast<Py_ssize_t>(text.size()), "replace");
+    if (!decoded) {
+        throw py::error_already_set();
+    }
+    return py::reinterpret_steal<py::str>(decoded);
+}
+
 uint64_t fnv1a_f32(const float * values, size_t count) {
     const auto * bytes = reinterpret_cast<const uint8_t *>(values);
     uint64_t hash = 1469598103934665603ULL;
@@ -600,7 +614,7 @@ public:
         }
 
         py::dict result;
-        result["text"] = generated_text;
+        result["text"] = utf8_lossy(generated_text);
         result["token_ids"] = generated;
         result["finish_reason"] = finish_reason;
         result["prompt_text_token_ids"] = prompt_text_tokens;
@@ -688,7 +702,7 @@ public:
         }
 
         py::dict result;
-        result["text"] = generated_text;
+        result["text"] = utf8_lossy(generated_text);
         result["token_ids"] = generated;
         result["finish_reason"] = finish_reason;
         return result;
@@ -839,7 +853,10 @@ PYBIND11_MODULE(qwen3asr_native, m) {
              py::arg("text"),
              py::arg("add_special") = false,
              py::arg("parse_special") = true)
-        .def("detokenize", &Qwen3ASRNative::detokenize_tokens,
+        .def("detokenize",
+             [](const Qwen3ASRNative & self, const std::vector<llama_token> & tokens, bool special) {
+                 return utf8_lossy(self.detokenize_tokens(tokens, special));
+             },
              py::arg("tokens"),
              py::arg("special") = true)
         .def("generate_once", &Qwen3ASRNative::generate_once,

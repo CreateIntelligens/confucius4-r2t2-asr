@@ -622,6 +622,7 @@ async def asr_stream_api_v1(websocket: WebSocket):
 
     STATE["active_streams"] += 1
     recv_task = asyncio.create_task(receiver())
+    close_code = 1000
     try:
         await send(
             {
@@ -662,11 +663,17 @@ async def asr_stream_api_v1(websocket: WebSocket):
         pass
     except Exception as exc:
         log.exception("requestId=%s 串流異常: %s", request_id, exc)
+        # 讓用戶端分得出「伺服器出錯」和「正常結束」：先送錯誤訊息，再用 1011 關閉。
+        close_code = 1011
+        try:
+            await send({"status": "error", "requestId": f"{request_id}", "msg": f"inference failed: {exc}"})
+        except Exception:
+            pass
     finally:
         STATE["active_streams"] -= 1
         recv_task.cancel()
         try:
-            await websocket.close()
+            await websocket.close(code=close_code)
         except RuntimeError:
             pass
 
