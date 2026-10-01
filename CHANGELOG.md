@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **GHCR 自動部署**：新增 GitHub Actions 工作流程，將 `main` 建置為 GHCR 版本映像，並由正式主機 runner 部署與執行健康檢查；失敗時還原原服務檔案。
 - **一般／深色模式與字幕工作台改版**：新增主題切換，OBS 空白狀態不再顯示無法操作的提示。
 - **長音檔逐段字幕**：新增 `POST /transcribe/stream`，每 30 秒建立獨立辨識狀態，逐段回傳字幕、音訊時間與進度。
 - **繁體中文輸出**：新增繁體／簡體選擇；繁體字幕使用 OpenCC 轉換辨識結果，即時串流與音檔轉寫皆適用。

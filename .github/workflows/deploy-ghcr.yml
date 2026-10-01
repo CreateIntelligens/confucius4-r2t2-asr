@@ -1,0 +1,109 @@
+name: Publish GHCR and deploy production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/createintelligens/confucius4-r2t2-asr-bundle
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ghcr
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, x64, r2t2-deploy]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Pull bundle and update the systemd service
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          image="$IMAGE_NAME:sha-${DEPLOY_SHA:0:7}"
+          work="$(mktemp -d /tmp/r2t2-deploy.XXXXXX)"
+          container="r2t2-deploy-${DEPLOY_SHA:0:7}"
+          service_dir=/home/david/r2t2-service
+          backup="$work/backup"
+          cleanup() {
+            docker logout ghcr.io >/dev/null 2>&1 || true
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            rm -rf "$work"
+          }
+          rollback() {
+            if [[ -d "$backup" ]]; then
+              sudo cp "$backup/server.py" "$service_dir/server.py"
+              sudo rm -rf "$service_dir/web"
+              sudo cp -a "$backup/web" "$service_dir/web"
+              sudo systemctl restart confucius4-r2t2.service || true
+            fi
+          }
+          trap cleanup EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker pull "$image"
+          docker create --name "$container" "$image" >/dev/null
+          mkdir -p "$work/bundle" "$backup"
+          docker cp "$container:/bundle/server.py" "$work/bundle/server.py"
+          docker cp "$container:/bundle/web" "$work/bundle/web"
+          cp "$service_dir/server.py" "$backup/server.py"
+          cp -a "$service_dir/web" "$backup/web"
+          sudo install -o david -g david -m 0644 "$work/bundle/server.py" "$service_dir/server.py"
+          sudo rm -rf "$service_dir/web"
+          sudo install -o david -g david -m 0755 -d "$service_dir/web"
+          sudo cp -a "$work/bundle/web/." "$service_dir/web/"
+          sudo chown -R david:david "$service_dir/web"
+          if ! sudo systemctl restart confucius4-r2t2.service; then
+            rollback
+            exit 1
+          fi
+          healthy=0
+          for attempt in $(seq 1 90); do
+            if python3 -c 'import json, urllib.request; d=json.load(urllib.request.urlopen("http://127.0.0.1:8040/health", timeout=5)); assert d.get("model_loaded") is True'; then
+              healthy=1
+              break
+            fi
+            sleep 10
+          done
+          if [[ "$healthy" != 1 ]]; then
+            sudo journalctl -u confucius4-r2t2.service -n 80 --no-pager
+            rollback
+            exit 1
+          fi
+          echo "Deployed $image and /health returned HTTP 200"

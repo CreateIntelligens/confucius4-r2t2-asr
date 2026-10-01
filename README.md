@@ -134,6 +134,12 @@ docker compose logs -f r2t2-api
    proxy_read_timeout 3600s;
    ```
 
+### 方法 C：GitHub Actions + GHCR 自動部署
+
+推送至 `main` 後，`.github/workflows/deploy-ghcr.yml` 會建立版本映像並發布至 GHCR，再由正式主機上的 `r2t2-deploy` self-hosted runner 拉取程式檔、更新 `/home/david/r2t2-service`，並重啟 `confucius4-r2t2.service`。部署完成條件為 `http://127.0.0.1:8040/health` 回傳成功；健康檢查逾時會還原上一份 `server.py` 與 `web/`。
+
+部署 runner 僅處理 `main` push 與手動觸發工作，不接收 Pull Request 工作。新主機設定 runner 時，需在該 repo 的 **Settings → Actions → Runners → New self-hosted runner** 註冊 Linux x64 runner，並加上 `r2t2-deploy` label；映像標籤包含 `latest` 與 `sha-<commit>`。
+
 ---
 
 ## 📡 外部 App 調用 API 指南 (External Application Integration)
