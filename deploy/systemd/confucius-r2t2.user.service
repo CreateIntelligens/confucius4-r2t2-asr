@@ -1,0 +1,30 @@
+[Unit]
+Description=Confucius4-R2T2 Streaming ASR Service (Port 8803)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/altos/confucius4-r2t2-asr/app
+ExecStart=/home/altos/Qwen3-ASR/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8803
+Restart=always
+RestartSec=5
+KillMode=control-group
+
+Environment=HOME=/home/altos
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/altos/confucius4-r2t2-asr/app
+Environment=MODEL_DIR=/home/altos/models/Confucius4-R2T2
+Environment=MODEL_ID=netease-youdao/Confucius4-R2T2
+Environment=VAD_DIR=/home/altos/models/FireRedVAD
+Environment=ASR_BACKEND=transformers
+Environment=AUTO_WARMUP=1
+Environment=AUTO_DOWNLOAD=0
+Environment=GPU_MEMORY_UTILIZATION=0.25
+Environment=VLLM_USE_FLASHINFER_SAMPLER=0
+
+StandardOutput=append:/home/altos/confucius4-r2t2-asr/service.log
+StandardError=append:/home/altos/confucius4-r2t2-asr/service.log
+
+[Install]
+WantedBy=default.target

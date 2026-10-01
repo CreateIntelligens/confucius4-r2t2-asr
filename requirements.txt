@@ -1,0 +1,26 @@
+# Docker 映像（app/main.py，Transformers 後端）的相依套件。
+# 不含 vLLM：它啟動時會先佔住「總記憶體 × 比例」的顯存，在統一記憶體的機器上
+# 動輒數十 GB；需要 vLLM 的主機另外 `pip install "vllm>=0.14.0"`，
+# main.py 在 ASR_BACKEND=auto 時裝了就會用。
+#
+# 安裝時 Dockerfile 用 --no-index 只讀 wheels/，所以 index 不能寫在這裡
+# （requirements 內的 --extra-index-url 會蓋過 --no-index）。
+# 下載 wheel 時要另外給（見 README）：
+#   pip download -r requirements.txt -d wheels/ \
+#       --extra-index-url https://download.pytorch.org/whl/cu130
+# 2.9.1 是這個模型在 GB10 上實際驗證過的版本。2.13 會把部分運算交給 triton 即時編譯，
+# 執行期需要 gcc 與 Python 標頭檔，runtime 映像沒有，推論會直接失敗。
+torch==2.9.1+cu130
+
+numpy
+transformers==4.57.6
+accelerate
+librosa==0.11.0
+soundfile==0.14.0
+fastapi==0.118.0
+uvicorn[standard]==0.37.0
+python-multipart==0.0.20
+fireredvad==0.0.2
+# qwen_asr 的 forced aligner 在匯入時就需要，即使服務沒用到對齊功能
+nagisa
+soynlp

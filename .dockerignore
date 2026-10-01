@@ -1,0 +1,9 @@
+.git
+.worktree
+.remember
+.pytest_cache
+**/__pycache__
+service.log
+tests
+deploy
+*.md

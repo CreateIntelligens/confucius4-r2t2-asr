@@ -3,3 +3,7 @@ __pycache__/
 *.so
 *.so.*
 .env
+service.log
+.pytest_cache/
+wheels/
+models/
