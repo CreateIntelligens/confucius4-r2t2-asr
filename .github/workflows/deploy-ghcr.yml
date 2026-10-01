@@ -62,6 +62,7 @@ jobs:
           container="r2t2-deploy-${DEPLOY_SHA:0:7}"
           service_dir=/home/david/r2t2-service
           backup="$work/backup"
+          export DOCKER_CONFIG="$work/docker"
           cleanup() {
             docker logout ghcr.io >/dev/null 2>&1 || true
             docker rm -f "$container" >/dev/null 2>&1 || true
@@ -76,10 +77,10 @@ jobs:
             fi
           }
           trap cleanup EXIT
+          mkdir -p "$DOCKER_CONFIG" "$work/bundle" "$backup"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
           docker pull "$image"
-          docker create --name "$container" "$image" >/dev/null
-          mkdir -p "$work/bundle" "$backup"
+          docker create --name "$container" "$image" /bundle/server.py >/dev/null
           docker cp "$container:/bundle/server.py" "$work/bundle/server.py"
           docker cp "$container:/bundle/web" "$work/bundle/web"
           cp "$service_dir/server.py" "$backup/server.py"
