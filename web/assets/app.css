@@ -131,24 +131,7 @@ button:focus-visible, input:focus-visible, select:focus-visible {
 .workspace {
   width: min(1440px, 100%);
   margin: 0 auto;
-  padding: 28px clamp(18px, 3vw, 38px) 44px;
-}
-.workspace-title {
-  margin: 0 0 21px;
-  display: flex;
-  justify-content: space-between;
-  align-items: end;
-  gap: 20px;
-}
-.workspace-title h2 { margin: 0; font-size: clamp(25px, 3vw, 34px); letter-spacing: -.04em; }
-.workspace-title p { margin: 7px 0 0; color: var(--muted); font-size: 14px; }
-.eyebrow {
-  margin: 0 0 7px !important;
-  color: var(--accent);
-  font-size: 12px !important;
-  font-weight: 750;
-  letter-spacing: .12em;
-  text-transform: uppercase;
+  padding: 24px clamp(18px, 3vw, 38px) 44px;
 }
 .workspace-grid {
   display: grid;
@@ -247,6 +230,11 @@ canvas#visualizer { display: block; width: 100%; height: 100%; }
 .progress-area[hidden] { display: none; }
 .progress-heading { display: flex; justify-content: space-between; gap: 12px; color: var(--ink); font-size: 12px; font-weight: 700; }
 .progress-heading span:last-child { color: var(--accent-strong); font-variant-numeric: tabular-nums; }
+.progress-tools { display: flex; align-items: center; gap: 10px; }
+.cancel-upload-btn { min-height: 28px; padding: 0 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--danger); font-size: 12px; font-weight: 700; cursor: pointer; }
+.cancel-upload-btn:hover { background: var(--surface-raised); }
+.cancel-upload-btn:disabled { cursor: wait; opacity: .6; }
+.cancel-upload-btn[hidden] { display: none; }
 .progress-track { height: 7px; margin: 11px 0 8px; overflow: hidden; border-radius: 99px; background: var(--surface-raised); }
 .progress-fill { width: 100%; height: 100%; border-radius: inherit; background: var(--accent); transform: scaleX(0); transform-origin: left; transition: transform 250ms ease; }
 .progress-meta { color: var(--muted); font-size: 12px; }
@@ -306,7 +294,7 @@ canvas#visualizer { display: block; width: 100%; height: 100%; }
 }
 .toast.show { opacity: 1; transform: translateY(0); }
 body.obs-mode { background: transparent !important; }
-body.obs-mode .app-header, body.obs-mode .workspace-title, body.obs-mode .control-card, body.obs-mode .side-column { display: none !important; }
+body.obs-mode .app-header, body.obs-mode .control-card, body.obs-mode .side-column { display: none !important; }
 body.obs-mode .workspace { width: 100%; height: 100vh; padding: 0; }
 body.obs-mode .workspace-grid { height: 100%; display: block; }
 body.obs-mode .main-column { height: 100%; justify-content: flex-end; }
@@ -318,7 +306,6 @@ body.obs-mode .caption-hero {
   background: transparent;
   box-shadow: none;
 }
-body.obs-mode .caption-hero:has(.caption-empty) { display: none; }
 body.obs-mode .stage-title, body.obs-mode .visualizer-container, body.obs-mode .stage-footer { display: none; }
 body.obs-mode .caption-text {
   max-height: 45vh;
@@ -326,6 +313,7 @@ body.obs-mode .caption-text {
   font-size: clamp(28px, 3.2vw, 52px);
   text-shadow: 0 2px 9px rgba(0, 0, 0, .9);
 }
+body.obs-mode .caption-empty { color: rgba(255, 255, 255, .78); font-size: 15px; font-style: normal; }
 body.obs-mode .toast { display: none; }
 @media (max-width: 980px) {
   .workspace-grid { grid-template-columns: 1fr; }
@@ -337,7 +325,6 @@ body.obs-mode .toast { display: none; }
   .header-tools { width: 100%; flex-wrap: wrap; }
   .status-pill { margin-right: auto; }
   .workspace { padding-top: 22px; }
-  .workspace-title { align-items: start; flex-direction: column; }
   .caption-hero { min-height: 300px; padding: 17px; }
   .control-card { padding: 18px; }
   .fields-grid { grid-template-columns: 1fr; }

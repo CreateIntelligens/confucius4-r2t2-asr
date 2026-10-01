@@ -1,0 +1,4 @@
+FROM scratch
+
+COPY server.py /bundle/server.py
+COPY web/ /bundle/web/

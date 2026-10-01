@@ -10,8 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **GHCR 自動部署**：新增 GitHub Actions 工作流程，將 `main` 建置為 GHCR 版本映像，並由正式主機 runner 部署與執行健康檢查；失敗時還原原服務檔案。
 - **一般／深色模式與字幕工作台改版**：新增主題切換，OBS 空白狀態不再顯示無法操作的提示。
 - **長音檔逐段字幕**：新增 `POST /transcribe/stream`，每 30 秒建立獨立辨識狀態，逐段回傳字幕、音訊時間與進度。
+- **繁體中文輸出**：新增繁體／簡體選擇；繁體字幕使用 OpenCC 轉換辨識結果，即時串流與音檔轉寫皆適用。
+- **停止音檔辨識**：新增工作 ID 與取消端點，可停止目前解碼步驟後的後續分段，並保留已完成字幕。
 - **前端資產拆分**：將樣式與互動程式移至 `web/assets/app.css` 與 `web/assets/app.js`，由 Sanic `/assets` 路由提供。
 
 ### Changed
@@ -30,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 環境變數 `VAD_DIR`、`STREAM_DEFAULT_LANGUAGE`、`STREAM_SECRET_KEYS`、`STALL_SECONDS`。
 - `tests/`（pytest）：語言對應、排隊鎖、串流 session、滑動視窗裁切，以及兩套服務、README、網頁之間的協議一致性檢查。
 - `deploy/systemd/confucius-r2t2.user.service`：GB10 上以 systemd user unit 執行 `app/main.py` 的設定。
+
+- **`app/main.py` 支援繁體輸出與停止上傳辨識**：`output_script`（串流 header 與兩個上傳端點）、`POST /transcribe/cancel` 與 `start` 事件的 `job_id`，與 `server.py` 相同。串流的繁體轉換以整句累積文字進行，被拆在兩則訊息裡的詞仍會轉成台灣慣用語；`final_text` 以整句轉換。
 
 ### Changed
 - **所有模型呼叫共用一個排隊鎖並在執行緒中執行**（`app/main.py` 與 `server.py`）：多路串流與批次請求輪流推論，不再阻塞事件迴圈。

@@ -9,6 +9,9 @@ let chunkCounter = 0;
 let currentSegmentText = "";
 let historyRecords = [];
 let isUploadingAudio = false;
+let activeUploadJobId = null;
+let uploadAbortController = null;
+let uploadCancelRequested = false;
 
 // DOM 元素
 const recordBtn = document.getElementById('record-btn');
@@ -26,6 +29,7 @@ const asrCostEl = document.getElementById('asr-cost');
 const totalCostEl = document.getElementById('total-cost');
 const chunkCountEl = document.getElementById('chunk-count');
 const langSelect = document.getElementById('lang-select');
+const outputScriptSelect = document.getElementById('output-script-select');
 const contextInput = document.getElementById('context-input');
 const secretKeyInput = document.getElementById('secret-key');
 const micSelect = document.getElementById('mic-select');
@@ -43,6 +47,7 @@ const uploadProgressLabel = document.getElementById('upload-progress-label');
 const uploadProgressTrack = document.getElementById('upload-progress-track');
 const uploadProgressFill = document.getElementById('upload-progress-fill');
 const uploadProgressMeta = document.getElementById('upload-progress-meta');
+const cancelUploadBtn = document.getElementById('cancel-upload-btn');
 const canvas = document.getElementById('visualizer');
 const canvasCtx = canvas.getContext('2d');
 
@@ -124,6 +129,11 @@ async function transcribeUploadedAudio(file) {
   isUploadingAudio = true;
   uploadBtn.disabled = true;
   recordBtn.disabled = true;
+  cancelUploadBtn.hidden = false;
+  cancelUploadBtn.disabled = false;
+  activeUploadJobId = null;
+  uploadCancelRequested = false;
+  uploadAbortController = new AbortController();
   sourceStatus.textContent = '音檔轉寫中';
   setUploadProgress(0, '正在準備音檔', `${file.name} · 每 30 秒辨識一段`);
   showCaptionStatus('音檔已上傳，完成的字幕片段會逐段顯示…');
@@ -131,6 +141,7 @@ async function transcribeUploadedAudio(file) {
   const formData = new FormData();
   formData.append('file', file, file.name);
   if (langSelect.value !== 'zhen') formData.append('language', langSelect.value);
+  formData.append('output_script', outputScriptSelect.value);
   if (contextInput.value.trim()) formData.append('context', contextInput.value.trim());
 
   let savedSegments = 0;
@@ -139,7 +150,11 @@ async function transcribeUploadedAudio(file) {
   let completed = false;
 
   try {
-    const response = await fetch('/transcribe/stream', { method: 'POST', body: formData });
+    const response = await fetch('/transcribe/stream', {
+      method: 'POST',
+      body: formData,
+      signal: uploadAbortController.signal,
+    });
     if (!response.ok) {
       const result = await response.json().catch(() => ({}));
       throw new Error(result.message || result.detail || `伺服器回應 ${response.status}`);
@@ -159,6 +174,7 @@ async function transcribeUploadedAudio(file) {
       const event = JSON.parse(data);
 
       if (event.type === 'start') {
+        activeUploadJobId = event.job_id || null;
         totalSegments = event.total_segments || 1;
         durationSec = Number(event.duration_sec) || 0;
         setUploadProgress(0, `準備辨識 ${totalSegments} 段音訊`, `音檔長度 ${formatAudioTime(durationSec)} · 每段 30 秒`);
@@ -175,10 +191,21 @@ async function transcribeUploadedAudio(file) {
         }
       } else if (event.type === 'done') {
         completed = true;
+        cancelUploadBtn.hidden = true;
         setUploadProgress(100, '音檔辨識完成', `${totalSegments} 段 · 音訊 ${formatAudioTime(event.duration_sec)}`);
         sourceStatus.textContent = '音檔已完成';
         if (!savedSegments) showCaptionStatus('音檔已處理，沒有辨識到語音。');
         showToast(savedSegments ? `辨識完成，共 ${savedSegments} 段字幕` : '音檔已處理，沒有辨識到語音');
+      } else if (event.type === 'cancelled') {
+        completed = true;
+        cancelUploadBtn.hidden = true;
+        sourceStatus.textContent = '已停止';
+        uploadStatus.textContent = '辨識已停止';
+        uploadProgressMeta.textContent = `已完成 ${event.completed_segments || 0} / ${totalSegments} 段；已完成字幕保留在右側紀錄。`;
+        showCaptionStatus(savedSegments
+          ? `音檔辨識已停止，已完成的 ${savedSegments} 段字幕仍保存在右側紀錄。`
+          : '音檔辨識已停止。');
+        showToast('已停止音檔辨識');
       } else if (event.type === 'error') {
         throw new Error(event.message || '音檔片段辨識失敗');
       }
@@ -195,10 +222,23 @@ async function transcribeUploadedAudio(file) {
     pending += decoder.decode();
     if (pending.trim()) handleEventBlock(pending);
     if (!completed) throw new Error('辨識連線中斷；已完成的字幕片段已保留。');
-  } catch (err) {
-    console.error('音檔辨識失敗:', err);
-    sourceStatus.textContent = '音檔辨識中斷';
+} catch (err) {
+  console.error('音檔辨識失敗:', err);
+  if (uploadCancelRequested || err.name === 'AbortError') {
+    completed = true;
+    cancelUploadBtn.hidden = true;
+    sourceStatus.textContent = '已停止';
+    uploadStatus.textContent = '辨識已停止';
+    uploadProgressMeta.textContent = '已完成的字幕片段已保留。';
     showCaptionStatus(savedSegments
+      ? `音檔辨識已停止，已完成的 ${savedSegments} 段字幕仍保存在右側紀錄。`
+      : '音檔辨識已停止。');
+    showToast('已停止音檔辨識');
+    return;
+  }
+  sourceStatus.textContent = '音檔辨識中斷';
+  cancelUploadBtn.hidden = true;
+  showCaptionStatus(savedSegments
       ? `辨識中斷，已完成的 ${savedSegments} 段字幕仍保存在右側紀錄。`
       : `音檔辨識失敗：${err.message || '請更換檔案後重試。'}`);
     uploadStatus.textContent = '辨識中斷';
@@ -208,6 +248,10 @@ async function transcribeUploadedAudio(file) {
     isUploadingAudio = false;
     uploadBtn.disabled = false;
     recordBtn.disabled = false;
+    cancelUploadBtn.hidden = true;
+    cancelUploadBtn.disabled = false;
+    activeUploadJobId = null;
+    uploadAbortController = null;
     audioFileInput.value = '';
     if (!isRecording && !completed && sourceStatus.textContent === '音檔轉寫中') sourceStatus.textContent = '待命';
   }
@@ -217,6 +261,29 @@ uploadBtn.addEventListener('click', () => audioFileInput.click());
 audioFileInput.addEventListener('change', () => {
   const file = audioFileInput.files && audioFileInput.files[0];
   if (file) transcribeUploadedAudio(file);
+});
+
+cancelUploadBtn.addEventListener('click', async () => {
+  if (!isUploadingAudio) return;
+  uploadCancelRequested = true;
+  cancelUploadBtn.disabled = true;
+  uploadStatus.textContent = '正在停止辨識…';
+
+  if (!activeUploadJobId) {
+    uploadAbortController?.abort();
+    return;
+  }
+
+  try {
+    const response = await fetch('/transcribe/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: activeUploadJobId }),
+    });
+    if (!response.ok) uploadAbortController?.abort();
+  } catch (err) {
+    uploadAbortController?.abort();
+  }
 });
 
 // 列出音訊設備
@@ -317,12 +384,18 @@ function resampleAndConvertToInt16(audioBuffer, inputSampleRate, targetSampleRat
   return result;
 }
 
-// 切換 OBS 模式
-obsToggle.addEventListener('click', () => {
-  const isObsMode = document.body.classList.toggle('obs-mode');
-  obsToggle.setAttribute('aria-pressed', String(isObsMode));
-  showToast(isObsMode ? 'OBS 字幕模式已開啟 · 按 Esc 返回控制台' : '已返回控制台');
-});
+    // 切換 OBS 模式
+    obsToggle.addEventListener('click', () => {
+      const enteringObsMode = !document.body.classList.contains('obs-mode');
+      const hasCaption = !captionBox.querySelector('.caption-empty') && captionBox.textContent.trim();
+      if (enteringObsMode && !isRecording && !isUploadingAudio && !hasCaption) {
+        showToast('請先開始收音或音檔辨識，再開啟 OBS 透明字幕。');
+        return;
+      }
+      const isObsMode = document.body.classList.toggle('obs-mode');
+      obsToggle.setAttribute('aria-pressed', String(isObsMode));
+      showToast(isObsMode ? '透明字幕已啟用，供 OBS 瀏覽器來源使用 · 按 Esc 返回' : '已返回控制台');
+    });
 
 // 建立 UUID
 function generateUUID() {
@@ -355,8 +428,9 @@ async function startRecording() {
         channels: 1,
         sample_rate: 16000,
         requestId: reqId,
-        language: langSelect.value,
-        use_vad: true,
+            language: langSelect.value,
+            output_script: outputScriptSelect.value,
+            use_vad: true,
         secret_key: secretKeyInput.value.trim() || 'test0102',
         mode: 'slow',
         system_prompt: contextInput.value.trim()
