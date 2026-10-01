@@ -1,5 +1,25 @@
 services:
+  # 宿主的模型目錄不存在時，Docker 會以 root 建立它，服務以宿主帳號執行就寫不進去，
+  # 自動下載會失敗。這裡只把「root 擁有」的掛載點交給宿主帳號；本來就有主人的目錄不動。
+  r2t2-init:
+    image: nginx:1.27-alpine
+    restart: "no"
+    user: "0:0"
+    environment:
+      OWNER: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    command:
+      - sh
+      - -c
+      - 'for d in /model /vad /gguf; do [ "$$(stat -c %u $$d)" = 0 ] && chown "$$OWNER" $$d; done; true'
+    volumes:
+      - ${MODEL_HOST_DIR:-./models/Confucius4-R2T2}:/model
+      - ${VAD_HOST_DIR:-./models/FireRedVAD}:/vad
+      - ${GGUF_HOST_DIR:-./models/Confucius4-R2T2-GGUF}:/gguf
+
   r2t2-api:
+    depends_on:
+      r2t2-init:
+        condition: service_completed_successfully
     # build 前先把 wheel 下到 wheels/（見 README），Dockerfile 以 --no-index 讀本機
     build:
       context: .
