@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/transcribe` 的 `text` 去除模型輸出的 `|` 標記。
 - **`app/main.py` 跟上新版網頁**：提供 `/assets`、`POST /transcribe/stream` 改為與 `server.py` 相同的逐段事件（`start`／`segment`／`done`），`/transcribe` 同樣每 30 秒分段並補上 `duration_sec`、`cost_ms` 欄位。原本的 token 增量 SSE 已移除。
 - `server.py` 的 `/transcribe`、`/transcribe/stream` 每一步解碼都經過排隊鎖。
+- **上傳音檔改用 soundfile + soxr 解碼**（`app/audio_io.py`）：輸出與 `librosa.load` 相同，但省掉它每個行程第一次呼叫的初始化（GB10 約 6 秒、A4000 主機約 27 秒），服務重啟後的第一個上傳不再卡住。
 - 網頁在句末採用 `final_text` 歸檔。
 - **Docker 映像改為 `builder` → `runner` 兩階段、以 `nvidia/cuda:13.0.3-cudnn-runtime` 為底**：原本的 `pytorch/pytorch` 基底只有 amd64，在 aarch64 的 GB10 上無法使用。相依套件改由 `requirements.txt` 加本機 `wheels/` 安裝，不含 vLLM；GPU 改用 CDI 掛載；模型改掛宿主目錄（`MODEL_HOST_DIR`、`VAD_HOST_DIR`）；容器以宿主帳號執行。
 
@@ -54,7 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/ws/stream` 結束時未送出 close frame。
 
 ### Known gaps
-- `server.py` 的修改尚未在 vLLM 主機上實測；本次只在 GB10（Transformers 後端）驗證了 `app/main.py`。
+- 已實測的組合：GB10（aarch64）的 Docker 映像（llama.cpp、Transformers）；RTX A4000（x86_64）的 Docker 映像（llama.cpp、Transformers）以及直接執行的 `server.py` 與 `app/main.py` 搭 vLLM 0.14。正式的 vLLM 主機（RTX 4000 Ada）尚未部署這一版。
+- vLLM 0.14 在 GB10 上無法啟動（CUDA 12 版本，且編譯工具不支援該晶片）；在 A4000 上需要 `gpu_memory_utilization` 約 0.50（約 6.2 GB），實測沒有比 Transformers 快。
 - `server.py` 沒有 `final_text`。
 ## [1.2.0] - 2026-09-30
 
