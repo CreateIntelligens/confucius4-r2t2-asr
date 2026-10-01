@@ -3,50 +3,85 @@ Confucius4-R2T2 Multi-Architecture Streaming & One-shot ASR Service
 Supports:
   - Automatic Model Download (Hugging Face netease-youdao/Confucius4-R2T2)
   - Automatic Warmup (1s Dummy Infer)
-  - Dual Backend Auto-Fallback: vLLM (Streaming LSP) with graceful fallback to Transformers
+  - Dual Backend Auto-Fallback: vLLM with graceful fallback to Transformers;
+    streaming works on both
   - Endpoints:
       GET /healthz
       POST /transcribe (one-shot file inference)
-      POST /transcribe/stream (Server-Sent Events streaming)
-      WS /ws/stream (Real-time PCM chunk WebSocket streaming)
+      POST /transcribe/stream (long files, one Server-Sent Event per 30 s segment)
+      WS /asr_stream_api_v1 (real-time PCM streaming with VAD sentence segmentation)
+      WS /ws/stream (minimal real-time PCM streaming, no segmentation)
 """
 
 import asyncio
-import io
 import json
 import logging
 import os
 import platform
-import shutil
 import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
 import librosa
 import numpy as np
-import soundfile as sf
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from huggingface_hub import snapshot_download
 from pydantic import BaseModel
 
 # Disable FlashInfer sampler to avoid nvcc JIT compilation requirement
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
-# Import local r2t2 package
+from infer_gate import InferGate
 from r2t2 import R2T2ASRModel
+from stream_session import StreamSession, unfixed_tail
+from textproc import clean_transcript, normalize_language
+from vad import load_vad_factory
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/model")
 MODEL_ID = os.environ.get("MODEL_ID", "netease-youdao/Confucius4-R2T2")
-ASR_BACKEND = os.environ.get("ASR_BACKEND", "auto").lower()  # auto | vllm | transformers
+ASR_BACKEND = os.environ.get("ASR_BACKEND", "auto").lower()  # auto | vllm | llama | transformers
+# auto 的嘗試順序：越前面越快，但越挑裝置；transformers 墊底，有 GPU 就一定能跑。
+AUTO_BACKEND_ORDER = ("vllm", "llama", "transformers")
+GGUF_DIR = os.environ.get("GGUF_DIR", os.path.join(os.environ.get("MODEL_DIR", "/model"), "gguf"))
+VLLM_MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "2048"))
 AUTO_DOWNLOAD = os.environ.get("AUTO_DOWNLOAD", "1") == "1"
 AUTO_WARMUP = os.environ.get("AUTO_WARMUP", "1") == "1"
 GPU_MEM_UTIL = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.35"))
+VAD_DIR = os.environ.get("VAD_DIR", os.path.join(MODEL_DIR, "FireRedVAD"))
+# 串流沒指定語言時用的預設值；「zhen」（中英混講）會對應成 Chinese，要自動判斷請設 auto。
+STREAM_DEFAULT_LANGUAGE = os.environ.get("STREAM_DEFAULT_LANGUAGE", "zhen")
+STREAM_SECRET_KEYS = {
+    k.strip()
+    for k in os.environ.get("STREAM_SECRET_KEYS", "test0102").split(",")
+    if k.strip()
+}
+# 單次推論卡超過這個秒數，/healthz 就回報 stalled。
+STALL_SECONDS = float(os.environ.get("STALL_SECONDS", "60"))
+
+# 上傳的音檔每 30 秒切一段各自辨識：整段丟進去會超過模型的 token 上限，
+# 分段也讓其他連線能在段與段之間插隊。與 server.py 的切法一致。
+TRANSCRIBE_SEGMENT_SECONDS = 30
+TRANSCRIBE_SEGMENT_SAMPLES = TRANSCRIBE_SEGMENT_SECONDS * 16000
+
+STREAM_EOS = "YOUDAO_ONETIME_ASR_STREAM_EOS"
+STREAM_RECV_TIMEOUT = 120
+MAX_SYSTEM_PROMPT_CHARS = 4000
+ERROR_MSG_NO_HEADER = "json header is expected"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("r2t2-service")
@@ -63,9 +98,11 @@ STATE = {
     "arch": platform.machine(),
     "vram_used_gb": 0.0,
     "error": None,
+    "vad": None,
+    "active_streams": 0,
 }
 
-INFER_LOCK = threading.Lock()
+GATE = InferGate()
 
 
 def _ensure_model_downloaded() -> None:
@@ -93,6 +130,39 @@ def _ensure_model_downloaded() -> None:
         log.info("本地已存在模型權重 (%s)", MODEL_DIR)
 
 
+def _load_vllm():
+    return R2T2ASRModel.LLM(
+        model=MODEL_DIR,
+        gpu_memory_utilization=GPU_MEM_UTIL,
+        max_model_len=VLLM_MAX_MODEL_LEN,
+        enforce_eager=True,
+        disable_log_stats=True,
+    )
+
+
+def _load_llama():
+    from llama_backend import R2T2LlamaModel, ensure_gguf, import_native
+
+    native_cls = import_native()
+    if native_cls is None:
+        raise RuntimeError("這個環境沒有編譯好的 llama.cpp 擴充")
+    paths = ensure_gguf(GGUF_DIR, AUTO_DOWNLOAD)
+    if paths is None:
+        raise RuntimeError(f"{GGUF_DIR} 內需要剛好一個解碼器 .gguf 與一個 mmproj .gguf")
+    return R2T2LlamaModel.load(MODEL_DIR, paths[0], paths[1], native_cls)
+
+
+def _load_transformers():
+    return R2T2ASRModel.from_pretrained(MODEL_DIR, device_map="cuda", dtype=torch.bfloat16)
+
+
+BACKEND_LOADERS = {
+    "vllm": _load_vllm,
+    "llama": _load_llama,
+    "transformers": _load_transformers,
+}
+
+
 def _load_model() -> None:
     """Load model with backend auto-selection and execute startup warmup."""
     if not torch.cuda.is_available():
@@ -114,49 +184,32 @@ def _load_model() -> None:
         log.exception(STATE["error"])
         return
 
-    # 2. 載入模型
+    # 2. 載入模型：auto 依序嘗試，哪個後端在這台裝置上起得來就用哪個
     t_load = time.time()
     model = None
     backend_used = None
-
-    # 若為 auto 或 vllm，先嘗試 vLLM
-    if ASR_BACKEND in ("auto", "vllm"):
-        log.info("嘗試初始化 vLLM 串流後端 (gpu_memory_utilization=%.2f)...", GPU_MEM_UTIL)
+    candidates = AUTO_BACKEND_ORDER if ASR_BACKEND == "auto" else (ASR_BACKEND,)
+    failures = []
+    for name in candidates:
+        loader = BACKEND_LOADERS.get(name)
+        if loader is None:
+            failures.append(f"{name}: 不支援的後端名稱")
+            continue
         try:
-            model = R2T2ASRModel.LLM(
-                model=MODEL_DIR,
-                gpu_memory_utilization=GPU_MEM_UTIL,
-                max_model_len=8192,
-                enforce_eager=True,
-                disable_log_stats=True,
-            )
-            backend_used = "vllm"
-            log.info("vLLM 後端載入成功！")
+            log.info("嘗試載入 %s 後端...", name)
+            model = loader()
+            backend_used = name
+            log.info("%s 後端載入成功！", name)
+            break
         except Exception as exc:
-            log.warning("vLLM 後端初始化失敗 (%s)", exc)
-            if ASR_BACKEND == "vllm":
-                STATE["error"] = f"指定 vLLM 後端但啟動失敗: {exc}"
-                STATE["status"] = "error"
-                log.exception(STATE["error"])
-                return
-            log.info("自動降級切換至 Transformers 後端...")
+            failures.append(f"{name}: {exc}")
+            log.warning("%s 後端無法使用 (%s)", name, exc)
 
-    # 若 vllm 未載入或指定 transformers
     if model is None:
-        try:
-            log.info("載入 Transformers 後端 (device_map=cuda, dtype=bfloat16)...")
-            model = R2T2ASRModel.from_pretrained(
-                MODEL_DIR,
-                device_map="cuda",
-                torch_dtype=torch.bfloat16,
-            )
-            backend_used = "transformers"
-            log.info("Transformers 後端載入成功！")
-        except Exception as exc:
-            STATE["error"] = f"Transformers 後端載入失敗: {exc}"
-            STATE["status"] = "error"
-            log.exception(STATE["error"])
-            return
+        STATE["error"] = "沒有可用的推論後端 — " + "；".join(failures)
+        STATE["status"] = "error"
+        log.error(STATE["error"])
+        return
 
     STATE["load_seconds"] = round(time.time() - t_load, 1)
     STATE["backend"] = backend_used
@@ -167,24 +220,22 @@ def _load_model() -> None:
         t_warmup = time.time()
         try:
             dummy_wav = np.zeros(16000, dtype=np.float32)
-            with INFER_LOCK:
-                if backend_used == "vllm":
-                    state = model.init_streaming_state(
-                        context="",
-                        language="Chinese",
-                        unfixed_chunk_num=0,
-                        unfixed_token_num=1,
-                        chunk_size_sec=0.32,
-                    )
-                    model.streaming_transcribe(dummy_wav, state, max_new_tokens=4)
-                    model.finish_streaming_transcribe(state, max_new_tokens=4)
-                else:
-                    model.transcribe(audio=[(dummy_wav, 16000)])
+            with GATE.run():
+                state = model.init_streaming_state(
+                    context="",
+                    language="Chinese",
+                    unfixed_chunk_num=0,
+                    unfixed_token_num=1,
+                    chunk_size_sec=0.32,
+                )
+                model.streaming_transcribe_no_reset(dummy_wav, state, 4)
+                model.transcribe(audio=[(dummy_wav, 16000)], language=["Chinese"])
             STATE["warmup_seconds"] = round(time.time() - t_warmup, 2)
             log.info("自動預熱完成，耗時 %.2f 秒", STATE["warmup_seconds"])
         except Exception as exc:
             log.warning("預熱失敗 (非致命): %s", exc)
 
+    STATE["vad"] = load_vad_factory(VAD_DIR, AUTO_DOWNLOAD)
     STATE["vram_used_gb"] = round(torch.cuda.memory_allocated() / 1024**3, 1)
     STATE["model"] = model
     STATE["model_loaded"] = True
@@ -230,14 +281,22 @@ class HealthResponse(BaseModel):
     load_seconds: Optional[float] = None
     warmup_seconds: Optional[float] = None
     error: Optional[str] = None
+    streaming: bool = False
+    vad_loaded: bool = False
+    active_streams: int = 0
+    inference: Optional[dict] = None
 
 
 @app.get("/healthz", response_model=HealthResponse)
 def healthz() -> HealthResponse:
     cuda = torch.cuda.is_available()
     vram = round(torch.cuda.memory_allocated() / 1024**3, 1) if cuda else 0.0
+    inference = GATE.snapshot()
+    status = STATE["status"]
+    if status == "ok" and inference["busy_seconds"] > STALL_SECONDS:
+        status = "stalled"
     return HealthResponse(
-        status=STATE["status"],
+        status=status,
         backend=STATE["backend"],
         model_loaded=STATE["model_loaded"],
         arch=STATE["arch"],
@@ -247,6 +306,10 @@ def healthz() -> HealthResponse:
         load_seconds=STATE["load_seconds"],
         warmup_seconds=STATE["warmup_seconds"],
         error=STATE["error"],
+        streaming=STATE["model_loaded"],
+        vad_loaded=STATE["vad"] is not None,
+        active_streams=STATE["active_streams"],
+        inference=inference,
     )
 
 
@@ -255,18 +318,25 @@ def health() -> HealthResponse:
     return healthz()
 
 
-@app.get("/")
-def serve_index():
+def _web_dir() -> str:
     web_dir = os.environ.get("WEB_DIR", "/web")
     if not os.path.exists(web_dir):
         local_web = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web")
         if os.path.exists(local_web):
             web_dir = local_web
-    index_file = os.path.join(web_dir, "index.html")
+    return web_dir
+
+
+@app.get("/")
+def serve_index():
+    index_file = os.path.join(_web_dir(), "index.html")
     if os.path.exists(index_file):
-        from fastapi.responses import FileResponse
         return FileResponse(index_file)
     return {"status": "ok", "service": "Confucius4-R2T2 ASR Service"}
+
+
+if os.path.isdir(os.path.join(_web_dir(), "assets")):
+    app.mount("/assets", StaticFiles(directory=os.path.join(_web_dir(), "assets")), name="web_assets")
 
 
 def _require_model():
@@ -279,42 +349,81 @@ def _require_model():
     return model
 
 
+def _resolve_language(model, language: Optional[str], default: Optional[str] = None) -> Optional[str]:
+    """Client language code -> model language name, None meaning auto-detect."""
+    lang = normalize_language(language, default)
+    if lang is not None and lang not in model.get_supported_languages():
+        raise ValueError(f"Unsupported language: {language}")
+    return lang
+
+
+def _batch_language(model, language: Optional[str]) -> Optional[str]:
+    try:
+        return _resolve_language(model, language)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+async def _save_upload(file: UploadFile) -> str:
+    content = await file.read()
+    suffix = Path(file.filename or "tmp.wav").suffix
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+        tf.write(content)
+        return tf.name
+
+
+def _transcribe_segment(model, wav: np.ndarray, context: str, lang: Optional[str]) -> str:
+    with GATE.run():
+        results = model.transcribe(
+            audio=[(wav, 16000)],
+            context=context,
+            language=[lang] if lang else None,
+            return_time_stamps=False,
+        )
+    return results[0].text
+
+
+def _segments(wav: np.ndarray):
+    for start in range(0, max(len(wav), 1), TRANSCRIBE_SEGMENT_SAMPLES):
+        yield start, wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
+
+
 @app.post("/transcribe")
 async def transcribe(
     file: UploadFile = File(..., description="音訊檔案 (wav, mp3, m4a, flac 等)"),
-    language: Optional[str] = Form(None, description="語言指定 (如 Chinese, English)"),
-    context: Optional[str] = Form("", description="熱詞或上下文提示詞"),
+    language: Optional[str] = Form(None, description="語言指定 (如 Chinese, English, zh, zhen；不填為自動判斷)"),
+    context: Optional[str] = Form("", description="熱詞或上下文提示詞 (如：請使用台灣繁體中文)"),
 ):
-    """一般離線單檔轉寫"""
+    """一般離線單檔轉寫 (支援防跳針清洗與自訂上下文/熱詞)；超過 30 秒自動分段，各段以換行串接"""
     model = _require_model()
-
-    content = await file.read()
-    with tempfile.NamedTemporaryFile(suffix=Path(file.filename or "tmp.wav").suffix, delete=False) as tf:
-        tf.write(content)
-        tmp_path = tf.name
+    lang_param = _batch_language(model, language)
+    tmp_path = await _save_upload(file)
 
     try:
         t0 = time.time()
-        wav, sr = librosa.load(tmp_path, sr=16000, mono=True)
-
-        def infer():
-            with INFER_LOCK:
-                results = model.transcribe(
-                    audio=[(wav, 16000)],
-                    context=context or "",
-                    language=[language] if language else None,
-                    return_time_stamps=False,
-                )
-                return results[0].text
-
-        text = await asyncio.to_thread(infer)
-        elapsed = round(time.time() - t0, 2)
+        wav, _ = await asyncio.to_thread(librosa.load, tmp_path, sr=16000, mono=True)
+        raw_parts, clean_parts = [], []
+        for _, segment in _segments(wav):
+            raw = await asyncio.to_thread(_transcribe_segment, model, segment, context or "", lang_param)
+            clean = clean_transcript(raw)
+            if clean:
+                raw_parts.append(raw)
+                clean_parts.append(clean)
+        raw_text = "\n".join(raw_parts)
+        clean_text = "\n".join(clean_parts)
+        elapsed = time.time() - t0
+        duration = round(len(wav) / 16000.0, 2)
         return JSONResponse(
             {
-                "text": text,
-                "elapsed_seconds": elapsed,
-                "audio_duration_seconds": round(len(wav) / 16000.0, 2),
+                "status": "success",
+                "text": clean_text,
+                "raw_text": raw_text if raw_text != clean_text else None,
+                "elapsed_seconds": round(elapsed, 2),
+                "audio_duration_seconds": duration,
                 "backend": STATE["backend"],
+                # server.py 的欄位名稱，兩套服務的用戶端可以共用
+                "duration_sec": duration,
+                "cost_ms": round(elapsed * 1000, 1),
             }
         )
     finally:
@@ -327,75 +436,66 @@ async def transcribe_stream(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     context: Optional[str] = Form(""),
-    chunk_ms: int = Form(160),
-    lookahead_ms: int = Form(160),
 ):
-    """SSE 模擬分塊即時流式轉寫 (Server-Sent Events)"""
+    """長音檔逐段辨識 (Server-Sent Events)：start → 每 30 秒一則 segment → done"""
     model = _require_model()
-    content = await file.read()
+    lang_param = _batch_language(model, language)
+    tmp_path = await _save_upload(file)
+    try:
+        wav, _ = await asyncio.to_thread(librosa.load, tmp_path, sr=16000, mono=True)
+    except Exception as exc:
+        log.exception("Audio decode error: %s", exc)
+        raise HTTPException(status_code=400, detail="無法讀取音訊檔案，請確認檔案格式後重試。")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-    with tempfile.NamedTemporaryFile(suffix=Path(file.filename or "tmp.wav").suffix, delete=False) as tf:
-        tf.write(content)
-        tmp_path = tf.name
+    def event(payload: dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     async def sse_generator():
-        try:
-            wav, _ = librosa.load(tmp_path, sr=16000, mono=True)
-            step_samples = int(round(chunk_ms / 1000.0 * 16000))
-            lookahead_samples = int(round(lookahead_ms / 1000.0 * 16000))
-            chunk_size_sec = (chunk_ms + lookahead_ms) / 1000.0
-
-            if STATE["backend"] == "vllm":
-                state = model.init_streaming_state(
-                    context=context or "",
-                    language=language,
-                    unfixed_chunk_num=0,
-                    unfixed_token_num=1,
-                    chunk_size_sec=chunk_size_sec,
-                )
-                pos = 0
-                is_first = True
-                prev_text = ""
-                max_tokens = max(1, int((step_samples + lookahead_samples) / 1280))
-
-                while pos < len(wav):
-                    if is_first:
-                        seg = wav[pos : pos + step_samples + lookahead_samples]
-                        is_first = False
-                    else:
-                        seg = wav[pos : pos + step_samples]
-                    pos += len(seg)
-
-                    def step_infer():
-                        with INFER_LOCK:
-                            _, raw = model.streaming_transcribe(seg, state, max_tokens)
-                            return raw.split("|")[0].strip()
-
-                    curr_text = await asyncio.to_thread(step_infer)
-                    if curr_text and curr_text != prev_text:
-                        delta = curr_text[len(prev_text):] if curr_text.startswith(prev_text) else curr_text
-                        if delta:
-                            yield f"data: {json.dumps({'type': 'token', 'delta': delta, 'text': curr_text}, ensure_ascii=False)}\n\n"
-                            prev_text = curr_text
-
-                def finish_infer():
-                    with INFER_LOCK:
-                        model.finish_streaming_transcribe(state, max_tokens)
-                        return state.text.split("|")[0].strip()
-
-                final_text = await asyncio.to_thread(finish_infer)
-                yield f"data: {json.dumps({'type': 'done', 'text': final_text}, ensure_ascii=False)}\n\n"
-            else:
-                # Transformers fallback
-                def full_infer():
-                    with INFER_LOCK:
-                        return model.transcribe(audio=[(wav, 16000)], language=[language] if language else None)[0].text
-
-                text = await asyncio.to_thread(full_infer)
-                yield f"data: {json.dumps({'type': 'done', 'text': text}, ensure_ascii=False)}\n\n"
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        duration_sec = len(wav) / 16000.0
+        total = max(1, (len(wav) + TRANSCRIBE_SEGMENT_SAMPLES - 1) // TRANSCRIBE_SEGMENT_SAMPLES)
+        started_at = time.time()
+        yield event(
+            {
+                "type": "start",
+                "duration_sec": round(duration_sec, 2),
+                "total_segments": total,
+                "segment_seconds": TRANSCRIBE_SEGMENT_SECONDS,
+            }
+        )
+        texts = []
+        for index, (start, segment) in enumerate(_segments(wav), start=1):
+            try:
+                raw = await asyncio.to_thread(_transcribe_segment, model, segment, context or "", lang_param)
+            except Exception as exc:
+                log.exception("Audio segment %s/%s failed: %s", index, total, exc)
+                yield event({"type": "error", "message": str(exc)})
+                return
+            text = clean_transcript(raw)
+            if text:
+                texts.append(text)
+            start_sec = start / 16000.0
+            yield event(
+                {
+                    "type": "segment",
+                    "index": index,
+                    "total": total,
+                    "start_sec": round(start_sec, 2),
+                    "end_sec": round(min(duration_sec, start_sec + len(segment) / 16000.0), 2),
+                    "text": text,
+                }
+            )
+        yield event(
+            {
+                "type": "done",
+                "text": "\n".join(texts),
+                "duration_sec": round(duration_sec, 2),
+                "elapsed_seconds": round(time.time() - started_at, 2),
+                "total_segments": total,
+            }
+        )
 
     return StreamingResponse(
         sse_generator(),
@@ -404,73 +504,234 @@ async def transcribe_stream(
     )
 
 
-@app.websocket("/ws/stream")
-async def websocket_stream(websocket: WebSocket):
+def _init_stream_state(model, context: str, language: Optional[str], chunk_size_sec: float):
+    # tokenizer 不能跨執行緒同時使用，建立 state 也要排隊。
+    with GATE.run():
+        return model.init_streaming_state(
+            context=context,
+            language=language,
+            unfixed_chunk_num=0,
+            unfixed_token_num=1,
+            chunk_size_sec=chunk_size_sec,
+        )
+
+
+def _stream_context(header: dict) -> str:
+    """Build the decoding context (smoothing hint + hotwords) from a stream header."""
+    parts = []
+    if header.get("smooth", False):
+        parts.append("Smooth the text")
+    system_prompt = header.get("system_prompt", "")
+    if not isinstance(system_prompt, str):
+        raise ValueError("system_prompt must be a string")
+    if len(system_prompt) > MAX_SYSTEM_PROMPT_CHARS:
+        raise ValueError(f"system_prompt must be at most {MAX_SYSTEM_PROMPT_CHARS} characters")
+    if system_prompt.strip():
+        parts.append(system_prompt.strip())
+    return "\n".join(parts)
+
+
+def _redact_header(header: dict) -> dict:
+    redacted = dict(header)
+    if "secret_key" in redacted:
+        redacted["secret_key"] = "[redacted]"
+    if "system_prompt" in redacted:
+        prompt = redacted["system_prompt"]
+        redacted["system_prompt"] = "[redacted]"
+        redacted["system_prompt_chars"] = len(prompt.strip()) if isinstance(prompt, str) else 0
+    return redacted
+
+
+def _pcm_from_bytes(raw: bytes) -> np.ndarray:
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+@app.websocket("/asr_stream_api_v1")
+async def asr_stream_api_v1(websocket: WebSocket):
     """
-    真實即時語音 WebSocket 串流端點。
-    客戶端持續送入 16kHz 16-bit Mono PCM 二進制音訊 chunk，
-    服務端利用 R2T2 LSP 只增不改機制即時推送辨識文字。
+    即時語音串流（有道 ws_server 協議）。
+    第一則訊息是 JSON header，之後持續送 16kHz 16-bit mono PCM，
+    以文字訊息 YOUDAO_ONETIME_ASR_STREAM_EOS 結束。
+    每句結束時回傳 reset=true，並附上整句重新辨識的 final_text。
     """
     await websocket.accept()
     model = STATE["model"]
-    if model is None or STATE["backend"] != "vllm":
-        await websocket.send_json(
-            {"type": "error", "detail": "vLLM 串流模型尚未就緒"}
+    if model is None:
+        await websocket.close(code=1011, reason="Server model not ready")
+        return
+
+    async def send(payload: dict) -> None:
+        await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+
+    try:
+        header = json.loads(
+            await asyncio.wait_for(websocket.receive_text(), STREAM_RECV_TIMEOUT)
         )
+        if not isinstance(header, dict) or "requestId" not in header:
+            raise ValueError(ERROR_MSG_NO_HEADER)
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        return
+    except (ValueError, KeyError):
+        await send({"status": "error", "msg": ERROR_MSG_NO_HEADER})
         await websocket.close()
         return
 
-    chunk_size_sec = 0.32
-    state = model.init_streaming_state(
-        context="",
-        language="Chinese",
-        unfixed_chunk_num=0,
-        unfixed_token_num=1,
-        chunk_size_sec=chunk_size_sec,
+    request_id = header["requestId"]
+    log.info("stream header=%s", _redact_header(header))
+    if header.get("secret_key") not in STREAM_SECRET_KEYS:
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+    try:
+        context = _stream_context(header)
+        language = _resolve_language(model, header.get("language"), STREAM_DEFAULT_LANGUAGE)
+    except ValueError as exc:
+        await send({"status": "error", "requestId": f"{request_id}", "msg": str(exc)})
+        await websocket.close()
+        return
+
+    vad_factory = STATE["vad"]
+    use_vad = bool(header.get("use_vad", True)) and vad_factory is not None
+    session = StreamSession(
+        model,
+        GATE,
+        request_id=request_id,
+        context=context,
+        language=language,
+        vad=vad_factory.new() if use_vad else None,
+        final_pass=bool(header.get("final_pass", True)),
     )
 
-    prev_text = ""
+    eos, stop = object(), object()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def receiver() -> None:
+        try:
+            while True:
+                message = await asyncio.wait_for(websocket.receive(), STREAM_RECV_TIMEOUT)
+                if message["type"] == "websocket.disconnect":
+                    break
+                if message.get("bytes") is not None:
+                    await queue.put(message["bytes"])
+                elif message.get("text") == STREAM_EOS:
+                    await queue.put(eos)
+                    break
+        except (asyncio.TimeoutError, WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            await queue.put(stop)
+
+    STATE["active_streams"] += 1
+    recv_task = asyncio.create_task(receiver())
+    try:
+        await send(
+            {
+                "status": "connected",
+                "requestId": f"{request_id}",
+                "msg": "",
+                "active_connections": STATE["active_streams"],
+                "language": language or "auto",
+                "vad": use_vad,
+            }
+        )
+        carry = b""
+        first_audio = True
+        while True:
+            # 一次取走所有已到的音訊：推論落後時併成較大的 chunk 追進度，不讓延遲越積越多。
+            items = [await queue.get()]
+            while not queue.empty():
+                items.append(queue.get_nowait())
+            raw = b"".join(i for i in items if isinstance(i, bytes))
+            if raw:
+                if first_audio:
+                    first_audio = False
+                    if raw[0:4] == b"RIFF" and raw[8:12] == b"WAVE":
+                        raw = raw[44:]
+                raw = carry + raw
+                carry = raw[len(raw) - (len(raw) % 2):]
+                msgs = await asyncio.to_thread(session.feed, _pcm_from_bytes(raw[: len(raw) - len(carry)]))
+                for msg in msgs:
+                    await send(msg)
+                if not msgs:
+                    await send({})
+            if any(i is eos for i in items):
+                await send(await asyncio.to_thread(session.finish))
+                break
+            if any(i is stop for i in items):
+                break
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    except Exception as exc:
+        log.exception("requestId=%s 串流異常: %s", request_id, exc)
+    finally:
+        STATE["active_streams"] -= 1
+        recv_task.cancel()
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass
+
+
+@app.websocket("/ws/stream")
+async def websocket_stream(websocket: WebSocket, language: Optional[str] = None):
+    """
+    精簡版即時串流：持續送入 16kHz 16-bit Mono PCM，回傳只增不改的文字。
+    不做 VAD 斷句；送 {"action": "finish"} 結束。需要斷句與熱詞請用 /asr_stream_api_v1。
+    """
+    await websocket.accept()
+    model = STATE["model"]
+    if model is None:
+        await websocket.send_json({"type": "error", "detail": "模型尚未就緒"})
+        await websocket.close()
+        return
+    try:
+        lang_param = _resolve_language(model, language, STREAM_DEFAULT_LANGUAGE)
+    except ValueError as exc:
+        await websocket.send_json({"type": "error", "detail": str(exc)})
+        await websocket.close()
+        return
+
+    state = await asyncio.to_thread(_init_stream_state, model, "", lang_param, 0.32)
+    sent = ""
     max_tokens = 4
 
     try:
         while True:
             data = await websocket.receive()
-            if "bytes" in data:
-                raw_bytes = data["bytes"]
-                # 轉成 float32 16k 音訊
-                pcm = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            if data["type"] == "websocket.disconnect":
+                break
+            if data.get("bytes") is not None:
+                pcm = _pcm_from_bytes(data["bytes"][: len(data["bytes"]) // 2 * 2])
 
-                def run_chunk():
-                    with INFER_LOCK:
-                        _, text_raw = model.streaming_transcribe(pcm, state, max_tokens)
-                        return text_raw.split("|")[0].strip()
+                def run_chunk(pcm=pcm):
+                    with GATE.run():
+                        _, fixed = model.streaming_transcribe_no_reset(pcm, state, max_tokens)
+                        return fixed.split("|")[0]
 
-                curr_text = await asyncio.to_thread(run_chunk)
-                if curr_text and curr_text != prev_text:
-                    delta = curr_text[len(prev_text):] if curr_text.startswith(prev_text) else curr_text
-                    if delta:
-                        await websocket.send_json(
-                            {
-                                "type": "token",
-                                "delta": delta,
-                                "text": curr_text,
-                                "is_final": False,
-                            }
-                        )
-                        prev_text = curr_text
+                fixed = await asyncio.to_thread(run_chunk)
+                if len(fixed) > len(sent):
+                    delta, sent = fixed[len(sent):], fixed
+                    await websocket.send_json(
+                        {
+                            "type": "token",
+                            "delta": delta,
+                            "text": sent,
+                            "is_final": False,
+                        }
+                    )
 
-            elif "text" in data:
+            elif data.get("text") is not None:
                 msg = json.loads(data["text"])
                 if msg.get("action") == "finish":
                     def run_finish():
-                        with INFER_LOCK:
-                            model.finish_streaming_transcribe(state, max_tokens)
-                            return state.text.split("|")[0].strip()
+                        with GATE.run():
+                            fixed = model.finish_streaming_transcribe_no_reset(state, max_tokens)
+                            return (fixed.split("|")[0] + unfixed_tail(state)).strip()
 
                     final_text = await asyncio.to_thread(run_finish)
                     await websocket.send_json(
                         {"type": "done", "text": final_text, "is_final": True}
                     )
+                    await websocket.close()
                     break
     except WebSocketDisconnect:
         pass

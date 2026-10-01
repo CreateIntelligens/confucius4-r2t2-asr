@@ -33,6 +33,8 @@ from qwen_asr.inference.utils import (
 
 _EN2ZH_PUNCT = {',': '，', '.': '。', '!': '！', '?': '？', ';': '；', ':': '：', '(': '（', ')': '）'}
 _ZH2EN_PUNCT = {v: k for k, v in _EN2ZH_PUNCT.items()}
+# Tokens the model needs for its own "language X<asr_text>" header.
+_LANG_TAG_TOKENS = 4
 _ALL_PUNCT_PAT = re.compile(r'[,\.!?;:()\uff0c\u3002\uff01\uff1f\uff1b\uff1a\uff08\uff09]')
 
 
@@ -185,6 +187,9 @@ class ASRStreamingState:
     chunk_text: List
     last_fixed_text: str
     _first_chunk_discarded: bool
+    chunk_samples: List
+    pending_samples: int
+    lang_meta: str
 
 class R2T2ASRModel(Qwen3ASRModel):
     def __init__(
@@ -223,6 +228,74 @@ class R2T2ASRModel(Qwen3ASRModel):
             return_time_stamps=return_time_stamps,
         )
 
+    @torch.no_grad()
+    def _generate_step(
+        self,
+        prompt: str,
+        audio: np.ndarray,
+        max_new_tokens=None,
+    ) -> str:
+        """Run one decode over ``audio`` continuing from ``prompt``.
+
+        Streaming re-feeds the whole audio window with the already fixed text
+        appended to the prompt, so the only backend-specific part is this
+        single generate call.
+        """
+        if self.backend == "vllm":
+            sampling_params = self.sampling_params
+            if max_new_tokens is not None:
+                from vllm import SamplingParams
+
+                sampling_params = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=int(max_new_tokens),
+                    skip_special_tokens=True,
+                )
+            inp = {"prompt": prompt, "multi_modal_data": {"audio": [audio]}}
+            outputs = self.model.generate([inp], sampling_params=sampling_params, use_tqdm=False)
+            return outputs[0].outputs[0].text
+
+        inputs = self.processor(text=[prompt], audio=[audio], return_tensors="pt", padding=True)
+        inputs = inputs.to(self.model.device).to(self.model.dtype)
+        text_ids = self.model.generate(
+            **inputs,
+            max_new_tokens=int(max_new_tokens or self.max_new_tokens),
+        )
+        decoded = self.processor.batch_decode(
+            text_ids.sequences[:, inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        return decoded[0]
+
+    @staticmethod
+    def _trim_streaming_window(state: "ASRStreamingState") -> None:
+        """Keep the rolling window under 16 s by dropping the oldest ~8 s.
+
+        The text of the dropped chunks leaves the prefix together with their
+        audio. Trimming by the samples each chunk actually covered (instead
+        of a fixed chunk count) keeps audio and prefix aligned when the
+        caller feeds chunks of varying size.
+        """
+        max_samples = 16 * SAMPLE_RATE
+        discard_samples = 8 * SAMPLE_RATE
+        if state.audio_accum.shape[0] <= max_samples:
+            return
+        dropped = 0
+        n = 0
+        while n < len(state.chunk_samples) and dropped < discard_samples:
+            dropped += state.chunk_samples[n]
+            n += 1
+        if dropped == 0:
+            # Nothing decoded yet (e.g. language still undetected on silence):
+            # there is no prefix to keep aligned, only audio to bound.
+            dropped = discard_samples
+            state.pending_samples = max(0, state.pending_samples - dropped)
+        state.audio_accum = state.audio_accum[dropped:]
+        state.chunk_text = state.chunk_text[n:]
+        state.chunk_samples = state.chunk_samples[n:]
+        state._first_chunk_discarded = True
+
     def init_streaming_state(
         self,
         context: str = "",
@@ -235,7 +308,7 @@ class R2T2ASRModel(Qwen3ASRModel):
         Initialize streaming ASR state for a single stream.
 
         Notes:
-            - Streaming ASR is supported ONLY for vLLM backend.
+            - Works on both the vLLM and the Transformers backend.
             - Streaming ASR does NOT support timestamps (forced aligner is not used).
             - Batch inference is NOT supported.
 
@@ -260,12 +333,10 @@ class R2T2ASRModel(Qwen3ASRModel):
 
         Raises:
             ValueError:
-                - If backend is not "vllm".
+                - If language is not supported.
                 - If chunk_size_sec <= 0.
                 - If forced language is invalid (same validation rules as transcribe()).
         """
-        if self.backend != "vllm":
-            raise ValueError("Streaming ASR is supported only for vLLM backend (backend='vllm').")
         if chunk_size_sec is None or float(chunk_size_sec) <= 0:
             raise ValueError(f"chunk_size_sec must be > 0, got: {chunk_size_sec}")
 
@@ -296,7 +367,10 @@ class R2T2ASRModel(Qwen3ASRModel):
             _raw_decoded="",
             chunk_text=[],
             last_fixed_text="",
-            _first_chunk_discarded=False
+            _first_chunk_discarded=False,
+            chunk_samples=[],
+            pending_samples=0,
+            lang_meta="",
         )
 
     def streaming_transcribe(
@@ -327,7 +401,7 @@ class R2T2ASRModel(Qwen3ASRModel):
                 * Else: rollback last unfixed_token_num tokens from previously accumulated decoded text.
 
         Notes:
-            - vLLM backend only.
+            - Works on both the vLLM and the Transformers backend.
             - No timestamps.
             - Single stream only (no batching).
 
@@ -345,12 +419,8 @@ class R2T2ASRModel(Qwen3ASRModel):
 
         Raises:
             ValueError:
-                If backend is not "vllm" or state is invalid.
+                If state is invalid.
         """
-        if max_new_tokens is not None:
-            from vllm import SamplingParams
-        if self.backend != "vllm":
-            raise ValueError("streaming_transcribe() is supported only for vLLM backend (backend='vllm').")
         if state is None:
             raise ValueError("state must not be None. Call init_streaming_state() first.")
         if pcm16k is None:
@@ -414,18 +484,7 @@ class R2T2ASRModel(Qwen3ASRModel):
             
             prompt = state.prompt_raw + prefix
 
-            # vLLM input: single item
-            inp = {"prompt": prompt, "multi_modal_data": {"audio": [state.audio_accum]}}
-            if max_new_tokens is not None:
-                sampling_params = SamplingParams(
-                    temperature=0.0,
-                    max_tokens=max_new_tokens,
-                    skip_special_tokens=True,
-                )
-                outputs = self.model.generate([inp], sampling_params=sampling_params, use_tqdm=False)
-            else:
-                outputs = self.model.generate([inp], sampling_params=self.sampling_params, use_tqdm=False)
-            gen_text = outputs[0].outputs[0].text
+            gen_text = self._generate_step(prompt, state.audio_accum, max_new_tokens)
             gen_text = _normalize_punct_by_context(gen_text).replace('\ufffd', '')
             #print(f"prefix={prefix}")
             state._raw_decoded = (prefix + gen_text) if prefix is not None else gen_text
@@ -502,7 +561,7 @@ class R2T2ASRModel(Qwen3ASRModel):
         without padding. Then it updates state.language/state.text one last time.
 
         Notes:
-            - vLLM backend only.
+            - Works on both the vLLM and the Transformers backend.
             - No timestamps.
             - Single stream only.
 
@@ -520,12 +579,8 @@ class R2T2ASRModel(Qwen3ASRModel):
 
         Raises:
             ValueError:
-                If backend is not "vllm" or state is invalid.
+                If state is invalid.
         """
-        if max_new_tokens is not None:
-            from vllm import SamplingParams
-        if self.backend != "vllm":
-            raise ValueError("finish_streaming_transcribe() is supported only for vLLM backend (backend='vllm').")
         if state is None:
             raise ValueError("state must not be None.")
 
@@ -553,18 +608,7 @@ class R2T2ASRModel(Qwen3ASRModel):
 
         prefix = prefix.split("|")[0]
         prompt = state.prompt_raw + prefix
-        inp = {"prompt": prompt, "multi_modal_data": {"audio": [state.audio_accum]}}
-
-        if max_new_tokens is not None:
-            sampling_params = SamplingParams(
-                temperature=0.0,
-                max_tokens=max_new_tokens,
-                skip_special_tokens=True,
-            )
-            outputs = self.model.generate([inp], sampling_params=sampling_params, use_tqdm=False)
-        else:
-            outputs = self.model.generate([inp], sampling_params=self.sampling_params, use_tqdm=False)
-        gen_text = outputs[0].outputs[0].text
+        gen_text = self._generate_step(prompt, state.audio_accum, max_new_tokens)
         gen_text = _normalize_punct_by_context(gen_text).replace('\ufffd', '')
 
         state._raw_decoded = (prefix + gen_text) if prefix is not None else gen_text
@@ -591,7 +635,7 @@ class R2T2ASRModel(Qwen3ASRModel):
         decodes each complete chunk, and updates the streaming state in place.
 
         Notes:
-            - vLLM backend only.
+            - Works on both the vLLM and the Transformers backend.
             - No timestamps.
             - Single stream only (no batching).
 
@@ -614,12 +658,8 @@ class R2T2ASRModel(Qwen3ASRModel):
 
         Raises:
             ValueError:
-                If backend is not "vllm", state is invalid, or pcm16k is None.
+                If state is invalid or pcm16k is None.
         """
-        if max_new_tokens is not None:
-            from vllm import SamplingParams
-        if self.backend != "vllm":
-            raise ValueError("streaming_transcribe() is supported only for vLLM backend (backend='vllm').")
         if state is None:
             raise ValueError("state must not be None. Call init_streaming_state() first.")
         if pcm16k is None:
@@ -652,45 +692,21 @@ class R2T2ASRModel(Qwen3ASRModel):
                 state.audio_accum = chunk
             else:
                 state.audio_accum = np.concatenate([state.audio_accum, chunk], axis=0)
-            # Once the accumulated audio reaches 16 seconds, discard the earliest 8 seconds and discard the corresponding text
-            max_samples = 16 * SAMPLE_RATE
-            discard_samples = 8 * SAMPLE_RATE
-            if state.audio_accum.shape[0] > max_samples:
-                keep_samples = state.audio_accum.shape[0] - discard_samples
-                # Calculate the exact number of chunks to discard: the first chunk is 320 ms (5,120 samples), and subsequent chunks are 160 ms (2,560 samples)
-                normal_chunk_samples = 2560  # 160ms
-                if not state._first_chunk_discarded:
-                    # First discard: the first chunk is 320 ms
-                    first_chunk_samples = 5120  # 320ms
-                    discard_chunks = 1 + (discard_samples - first_chunk_samples) // normal_chunk_samples  # = 49
-                    state._first_chunk_discarded = True
-                else:
-                    # Subsequent discards: all chunks are 160 ms
-                    discard_chunks = discard_samples // normal_chunk_samples  # = 50
-                state.audio_accum = state.audio_accum[-keep_samples:]
-                state.chunk_text = state.chunk_text[discard_chunks:]
+            state.pending_samples += int(chunk.shape[0])
+            self._trim_streaming_window(state)
 
             prefix_text = "".join(state.chunk_text)
-            if state.force_language == None and state.language != "":
-                prefix = f"language {state.language}<asr_text>" + prefix_text
-            else:
-                prefix = prefix_text
+            prefix = state.lang_meta + prefix_text
+            step_tokens = max_new_tokens
+            if state.force_language == None and state.lang_meta == "" and max_new_tokens is not None:
+                # Until the tag is pinned the model spends its first tokens
+                # re-emitting "language X<asr_text>" on every step.
+                step_tokens = max_new_tokens + _LANG_TAG_TOKENS
             prefix = prefix.split("|")[0] 
 
             prompt = state.prompt_raw + prefix
 
-            # vLLM input: single item
-            inp = {"prompt": prompt, "multi_modal_data": {"audio": [state.audio_accum]}}
-            if max_new_tokens is not None:
-                sampling_params = SamplingParams(
-                    temperature=0.0,
-                    max_tokens=max_new_tokens,
-                    skip_special_tokens=True,
-                )
-                outputs = self.model.generate([inp], sampling_params=sampling_params, use_tqdm=False)
-            else:
-                outputs = self.model.generate([inp], sampling_params=self.sampling_params, use_tqdm=False)
-            gen_text = outputs[0].outputs[0].text
+            gen_text = self._generate_step(prompt, state.audio_accum, step_tokens)
             # gen_text = gen_text.replace("#","|")
             gen_text = _normalize_punct_by_context(gen_text).replace('\ufffd', '')
 
@@ -757,6 +773,14 @@ class R2T2ASRModel(Qwen3ASRModel):
                 new_asr_text = ""
             new_asr_text = new_asr_text.split("|")[0]
             state.chunk_text.append(new_asr_text)
+            if state.force_language == None and state.lang_meta == "" and new_asr_text:
+                # Pin the tag exactly as the model wrote it (it may well be
+                # "language None") once text starts being fixed. Rebuilding it
+                # from the parsed language dropped the "None" case, leaving the
+                # prefix without a tag and the transcript stuck on its first token.
+                state.lang_meta = state._raw_decoded.split("<asr_text>")[0] + "<asr_text>"
+            state.chunk_samples.append(state.pending_samples)
+            state.pending_samples = 0
             state.last_fixed_text = state.last_fixed_text + new_asr_text
 
 
@@ -776,7 +800,7 @@ class R2T2ASRModel(Qwen3ASRModel):
         finalized text to ``state.last_fixed_text``.
 
         Notes:
-            - vLLM backend only.
+            - Works on both the vLLM and the Transformers backend.
             - No timestamps.
             - Single stream only.
 
@@ -795,12 +819,8 @@ class R2T2ASRModel(Qwen3ASRModel):
 
         Raises:
             ValueError:
-                If backend is not "vllm" or state is invalid.
+                If state is invalid.
         """
-        if max_new_tokens is not None:
-            from vllm import SamplingParams
-        if self.backend != "vllm":
-            raise ValueError("finish_streaming_transcribe() is supported only for vLLM backend (backend='vllm').")
         if state is None:
             raise ValueError("state must not be None.")
 
@@ -817,46 +837,19 @@ class R2T2ASRModel(Qwen3ASRModel):
             state.audio_accum = tail
         else:
             state.audio_accum = np.concatenate([state.audio_accum, tail], axis=0)
+        state.pending_samples += int(tail.shape[0])
 
-        # Once the accumulated audio reaches 16 seconds, discard the earliest 8 seconds and discard the corresponding text
-        max_samples = 16 * SAMPLE_RATE
-        discard_samples = 8 * SAMPLE_RATE
-        if state.audio_accum.shape[0] > max_samples:
-            keep_samples = state.audio_accum.shape[0] - discard_samples
-            # Calculate the exact number of chunks to discard: the first chunk is 320 ms (5,120 samples), and subsequent chunks are 160 ms (2,560 samples)
-            normal_chunk_samples = 2560  # 160ms
-            if not state._first_chunk_discarded:
-                # First discard: the first chunk is 320 ms
-                first_chunk_samples = 5120  # 320ms
-                discard_chunks = 1 + (discard_samples - first_chunk_samples) // normal_chunk_samples  # = 49
-                state._first_chunk_discarded = True
-            else:
-                # Subsequent discards: all chunks are 160 ms
-                discard_chunks = discard_samples // normal_chunk_samples  # = 50
-            state.audio_accum = state.audio_accum[-keep_samples:]
-            state.chunk_text = state.chunk_text[discard_chunks:]
+        self._trim_streaming_window(state)
 
         prefix_text = "".join(state.chunk_text)
-        if state.force_language == None and state.language != "":
-            prefix = f"language {state.language}<asr_text>" + prefix_text
-        else:
-            prefix = prefix_text
+        prefix = state.lang_meta + prefix_text
+        if state.force_language == None and state.lang_meta == "" and max_new_tokens is not None:
+            max_new_tokens = max_new_tokens + _LANG_TAG_TOKENS
 
         prefix = prefix.split("|")[0]    
         prompt = state.prompt_raw + prefix
 
-        inp = {"prompt": prompt, "multi_modal_data": {"audio": [state.audio_accum]}}
-
-        if max_new_tokens is not None:
-            sampling_params = SamplingParams(
-                temperature=0.0,
-                max_tokens=max_new_tokens,
-                skip_special_tokens=True,
-            )
-            outputs = self.model.generate([inp], sampling_params=sampling_params, use_tqdm=False)
-        else:
-            outputs = self.model.generate([inp], sampling_params=self.sampling_params, use_tqdm=False)
-        gen_text = outputs[0].outputs[0].text
+        gen_text = self._generate_step(prompt, state.audio_accum, max_new_tokens)
    
         gen_text = _normalize_punct_by_context(gen_text).replace('\ufffd', '')
         print(f"finish gen_text={gen_text}")
@@ -872,6 +865,8 @@ class R2T2ASRModel(Qwen3ASRModel):
         fixed_text_stripped = txt.strip()
         new_asr_text = fixed_text_stripped[len(prefix_stripped):]
         state.chunk_text.append(new_asr_text)
+        state.chunk_samples.append(state.pending_samples)
+        state.pending_samples = 0
         state.last_fixed_text = state.last_fixed_text + new_asr_text
         return state.last_fixed_text
     
