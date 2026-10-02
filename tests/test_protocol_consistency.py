@@ -59,12 +59,13 @@ def test_nothing_documents_a_wrong_eos_string():
         assert "asr_eos_string\"" not in text.lower().replace("youdao_onetime_asr_eos_string = ", "")
 
 
-def test_server_py_transcribe_goes_through_the_gate():
+def test_server_py_uploads_go_through_the_scheduler():
     source = read("server.py")
-    handlers = source[source.index("async def transcribe_audio_segment"):source.index("# Streaming WebSocket v1")]
-    # decoding audio bytes may use a plain thread; model calls may not
+    handlers = source[source.index("async def _transcribe_audio_segment"):source.index("# Streaming WebSocket v1")]
+    # decoding audio bytes may use a plain thread; model calls must be queued
     assert re.findall(r"(?<![\w.])asr_model\.\w+\(", handlers) == []
-    assert "to_thread(_transcribe" not in handlers and "to_thread(run_infer" not in handlers
+    assert "inference_scheduler.submit(" in handlers
+    assert "priority=1" in handlers
 
 
 def test_upload_stream_events_match_between_servers_and_ui():

@@ -111,8 +111,8 @@ def test_cancel_stops_before_the_next_segment(upload_client, monkeypatch):
     client, path = upload_client
     real = main._transcribe_segment
 
-    def cancel_after_first(model, segment, context, lang):
-        text = real(model, segment, context, lang)
+    def cancel_after_first(model, segment, context, lang, priority):
+        text = real(model, segment, context, lang, priority)
         (job_id,) = main.UPLOAD_JOBS
         assert client.post("/transcribe/cancel", json={"job_id": job_id}).json()["status"] == "cancelling"
         return text
@@ -137,3 +137,50 @@ def test_stream_header_output_script_is_echoed_and_validated(client):
     with client.websocket_connect("/asr_stream_api_v1") as ws:
         ws.send_text(header(output_script="pinyin"))
         assert json.loads(ws.receive_text())["status"] == "error"
+
+
+def test_streams_beyond_the_limit_are_turned_away(client, monkeypatch):
+    monkeypatch.setattr(main, "MAX_CONCURRENT_STREAMS", 1)
+    with client.websocket_connect("/asr_stream_api_v1") as first:
+        first.send_text(header(use_vad=False))
+        assert json.loads(first.receive_text())["status"] == "connected"
+        with client.websocket_connect("/asr_stream_api_v1") as second:
+            second.send_text(header(use_vad=False))
+            reply = json.loads(second.receive_text())
+            assert reply["status"] == "error" and "max concurrent streams" in reply["msg"]
+            with pytest.raises(WebSocketDisconnect) as closed:
+                second.receive_text()
+            assert closed.value.code == 1013
+    assert main.STATE["active_streams"] == 0
+
+
+def gate_priorities(monkeypatch):
+    seen = []
+    real_run = main.GATE.run
+
+    def spy(priority=0):
+        seen.append(priority)
+        return real_run(priority)
+
+    monkeypatch.setattr(main.GATE, "run", spy)
+    return seen
+
+
+def test_long_uploads_queue_behind_live_work(upload_client, monkeypatch):
+    client, path = upload_client  # 65 s -> three segments
+    seen = gate_priorities(monkeypatch)
+    with open(path, "rb") as f:
+        client.post("/transcribe", files={"file": f})
+    assert seen and set(seen) == {main.BATCH}
+
+
+def test_short_clips_are_treated_as_interactive(upload_client, monkeypatch, tmp_path):
+    import soundfile as sf
+
+    client, _ = upload_client
+    clip = tmp_path / "clip.wav"
+    sf.write(clip, np.zeros(16000 * 4, dtype=np.float32), 16000)
+    seen = gate_priorities(monkeypatch)
+    with open(clip, "rb") as f:
+        client.post("/transcribe", files={"file": f})
+    assert seen == [main.LIVE]

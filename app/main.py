@@ -47,7 +47,7 @@ from pydantic import BaseModel
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
 from audio_io import load_audio
-from infer_gate import InferGate
+from infer_gate import BATCH, LIVE, InferGate
 from r2t2 import R2T2ASRModel
 from script_convert import convert_text, resolve_output_script
 from stream_session import StreamSession, unfixed_tail
@@ -72,6 +72,10 @@ STREAM_SECRET_KEYS = {
     for k in os.environ.get("STREAM_SECRET_KEYS", "test0102").split(",")
     if k.strip()
 }
+# 有人在講話時，上傳音檔最多每隔這麼多秒佔用一次推論（一次約一兩秒）。
+UPLOAD_MIN_INTERVAL_SECONDS = float(os.environ.get("UPLOAD_MIN_INTERVAL_SECONDS", "5"))
+# 同時進行的即時串流上限。超過就拒絕新連線，不要讓所有人一起變慢。
+MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "12"))
 # 單次推論卡超過這個秒數，/healthz 就回報 stalled。
 STALL_SECONDS = float(os.environ.get("STALL_SECONDS", "60"))
 
@@ -104,7 +108,7 @@ STATE = {
     "active_streams": 0,
 }
 
-GATE = InferGate()
+GATE = InferGate(batch_interval=UPLOAD_MIN_INTERVAL_SECONDS)
 
 # 進行中的上傳辨識：job_id -> 取消旗標。/transcribe/cancel 設旗標，辨識迴圈在段與段之間檢查。
 UPLOAD_JOBS: dict = {}
@@ -396,8 +400,19 @@ async def _save_upload(file: UploadFile) -> str:
         return tf.name
 
 
-def _transcribe_segment(model, wav: np.ndarray, context: str, lang: Optional[str]) -> str:
-    with GATE.run():
+def _upload_priority(wav: np.ndarray) -> int:
+    """Short clips are someone waiting for an answer; long files are background work.
+
+    一段以內的音檔（30 秒內）通常是互動式的批次辨識，和串流一樣排在前面；
+    要切成多段的長音檔才當成背景工作，有人在講話時讓路。
+    """
+    return LIVE if len(wav) <= TRANSCRIBE_SEGMENT_SAMPLES else BATCH
+
+
+def _transcribe_segment(
+    model, wav: np.ndarray, context: str, lang: Optional[str], priority: int = BATCH
+) -> str:
+    with GATE.run(priority):
         results = model.transcribe(
             audio=[(wav, 16000)],
             context=context,
@@ -429,8 +444,11 @@ async def transcribe(
         t0 = time.time()
         wav = await asyncio.to_thread(load_audio, tmp_path)
         raw_parts, clean_parts = [], []
+        priority = _upload_priority(wav)
         for _, segment in _segments(wav):
-            raw = await asyncio.to_thread(_transcribe_segment, model, segment, context or "", lang_param)
+            raw = await asyncio.to_thread(
+                _transcribe_segment, model, segment, context or "", lang_param, priority
+            )
             clean = convert_text(clean_transcript(raw), script)
             if clean:
                 raw_parts.append(raw)
@@ -486,6 +504,7 @@ async def transcribe_stream(
         total = max(1, (len(wav) + TRANSCRIBE_SEGMENT_SAMPLES - 1) // TRANSCRIBE_SEGMENT_SAMPLES)
         started_at = time.time()
         job_id = uuid.uuid4().hex
+        priority = _upload_priority(wav)
         cancel = threading.Event()
         UPLOAD_JOBS[job_id] = cancel
         completed = 0
@@ -505,7 +524,9 @@ async def transcribe_stream(
                     yield event({"type": "cancelled", "completed_segments": completed})
                     return
                 try:
-                    raw = await asyncio.to_thread(_transcribe_segment, model, segment, context or "", lang_param)
+                    raw = await asyncio.to_thread(
+                _transcribe_segment, model, segment, context or "", lang_param, priority
+            )
                 except Exception as exc:
                     log.exception("Audio segment %s/%s failed: %s", index, total, exc)
                     yield event({"type": "error", "message": str(exc)})
@@ -642,6 +663,19 @@ async def asr_stream_api_v1(websocket: WebSocket):
     except ValueError as exc:
         await send({"status": "error", "requestId": f"{request_id}", "msg": str(exc)})
         await websocket.close()
+        return
+
+    if STATE["active_streams"] >= MAX_CONCURRENT_STREAMS:
+        log.warning("拒絕串流連線：已達同時串流上限 (%d)", MAX_CONCURRENT_STREAMS)
+        await send(
+            {
+                "status": "error",
+                "requestId": f"{request_id}",
+                "msg": "server busy: max concurrent streams reached",
+            }
+        )
+        # 1013 = Try Again Later，與 server.py 相同
+        await websocket.close(code=1013, reason="Server busy: max streaming capacity reached")
         return
 
     vad_factory = STATE["vad"]
