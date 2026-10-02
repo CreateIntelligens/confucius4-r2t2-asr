@@ -9,9 +9,9 @@
 ## 🌐 線上運行實例與外部存取
 
 #### 1. 外部存取網址
-- **網頁字幕操作介面**：[https://147.5gao.ai/](https://147.5gao.ai/)
+- **網頁字幕操作介面**：[https://asr.5gao.ai/](https://asr.5gao.ai/)（或相容舊域名 [https://147.5gao.ai/](https://147.5gao.ai/)）
 - **內網直接存取**：`http://10.9.0.35:8040/`
-- **健康檢查端點**：`https://147.5gao.ai/health`
+- **健康檢查端點**：`https://asr.5gao.ai/health`（或 `https://147.5gao.ai/health`）
   ```json
   {
     "status": "healthy",
