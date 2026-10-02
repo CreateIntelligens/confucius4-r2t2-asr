@@ -217,6 +217,7 @@ class FairInferenceScheduler:
         self._worker_thread: Optional[threading.Thread] = None
         self._running = False
         self._consecutive_live = 0
+        self._has_task = threading.Event()
 
     @property
     def qsize(self) -> int:
@@ -244,6 +245,7 @@ class FairInferenceScheduler:
 
     def stop(self):
         self._running = False
+        self._has_task.set()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3.0)
         self._drain_queues_on_shutdown()
@@ -269,6 +271,7 @@ class FairInferenceScheduler:
 
         try:
             target_queue.put_nowait(task)
+            self._has_task.set()
         except queue.Full:
             raise RuntimeError(f"ASR inference queue (priority {priority}) is full")
 
@@ -299,8 +302,12 @@ class FairInferenceScheduler:
         while self._running:
             task = self._get_next_task()
             if task is None:
-                time.sleep(0.005)
-                continue
+                self._has_task.clear()
+                # Double-check before waiting to avoid missed wakeup
+                task = self._get_next_task()
+                if task is None:
+                    self._has_task.wait(timeout=0.1)
+                    continue
 
             # Thread-safe cancellation check: skip execution if client disconnected
             if task.cancelled_event.is_set():
@@ -835,8 +842,16 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
         return
 
     audio_buf = np.ndarray(shape=(0,), dtype=np.float32)
-    header_raw = await ws.recv()
-    header = json.loads(header_raw)
+    try:
+        header_raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
+        header = json.loads(header_raw)
+        if not isinstance(header, dict):
+            await ws.close(code=4400, reason="Invalid JSON object")
+            return
+    except Exception as e:
+        logger.warning(f"Invalid or timed-out handshake: {e}")
+        await ws.close(code=4400, reason="Invalid handshake header")
+        return
     logger.info(f"header={redact_stream_request_header(header)}")
 
     is_first_seg = True
@@ -1132,9 +1147,18 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
     proc_task = asyncio.create_task(processor())
     try:
         done, pending = await asyncio.wait([recv_task, proc_task], return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
-            t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        if proc_task in done:
+            # Processor exited first (completed normally, auth failure, or error) -> cancel receiver
+            recv_task.cancel()
+            await asyncio.gather(recv_task, return_exceptions=True)
+        else:
+            # Receiver exited first (client sent EOS or closed socket).
+            # Receiver already enqueued _STOP; allow processor to drain remaining chunks and EOS.
+            try:
+                await asyncio.wait_for(proc_task, timeout=15.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                proc_task.cancel()
+                await asyncio.gather(proc_task, return_exceptions=True)
     finally:
         if counted:
             active_connections = max(0, active_connections - 1)

@@ -25,7 +25,9 @@ Versions are categorized by date (`YYYY-MM-DD`).
   - VAD 異步化與安全隔離：將 FireRedVAD 檢測移至 `asyncio.to_thread` 執行緒池，徹底解放 Sanic 主事件迴圈；克隆失敗時安全關閉 VAD，杜絕跨連線特徵快取污染。
   - 連續說話長度溢出防護 (`MAX_CONTINUOUS_SPEECH_SEC=25.0`)：超過 25 秒無停頓自動觸發語意分段重設，防止超出 vLLM `max_model_len=2048` 崩潰。
   - 串流連線上限門禁 (`MAX_CONCURRENT_STREAMS=12`)：超載時回傳 1013 Server Busy，防止單卡排隊延遲雪崩。
-  - 雙向任務生命週期監控：以 `asyncio.wait(..., return_when=FIRST_COMPLETED)` 監管 `receiver` 與 `processor`，徹底消除客戶端提早退出時的協程與 Socket 洩漏。
+  - 雙向非對稱任務生命週期監控：以 `asyncio.wait(..., return_when=FIRST_COMPLETED)` 監管；當 `receiver` 收到 EOS 先結束時，非對稱允許 `processor` 完整排空剩餘音訊切片並傳回最終字幕，徹底消除協程洩漏與提早截斷。
+  - Zero-Polling 空轉待機：`FairInferenceScheduler` 引入 `threading.Event` 事件喚醒，實現佇列為空時零 CPU 耗損。
+  - Handshake 握手安全：加入 10 秒握手逾時與 JSON 物件型別校驗，防範未認證連線長期佔用 Socket。
   - 防禦性關閉與佇列清理：`_dispatch_to_loop` 防止 Event Loop 關閉時 Worker 線程拋出異常死亡；`stop()` 自動拒絕殘留任務。
   - 健壯性 PCM 解碼：`read_pcm` 自動防範奇數長度與截斷二進位音訊封包。
   - 於 `GET /health` 端點新增 `"queue_size"` 即時排隊深度監控。
