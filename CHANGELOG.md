@@ -23,6 +23,11 @@ Versions are categorized by date (`YYYY-MM-DD`).
   - 設計並產出標準 1200×630 尺寸 Open Graph 社群分享圖 (`web/assets/og-image.png`，524KB) 與社交 Meta 標籤。
 
 ### Fixed
+- **vLLM 推論線程競爭死鎖與事件循環阻塞修復 (Inference Thread Lock & Event Loop Decoupling)**：
+  - 診斷出當 HTTP 轉寫請求 (`/transcribe`、`/transcribe/stream`) 與 WebSocket 實時流 (`/asr_stream_api_v1`) 同時並發調用時，因底層 vLLM V1 引擎 `LLM.generate` 缺乏線程安全保護，導致多線程同時向 EngineCore IPC 佇列發送請求並在 `outputs_queue.get()` 相互競爭搶奪輸出，造成跨進程死鎖、Sanic 主線程陷入 futex 阻塞，導致整機連線超時假死。
+  - 引入全域互斥鎖 `ASR_INFER_LOCK` 嚴格序列化每次 `generate` 推論，長音檔以 0.32 秒極小粒度推論並釋放鎖，使 WebSocket 即時語音能以 ~15ms 級微小延遲交錯運算，兼顧即時性與高並發安全。
+  - 將 WebSocket 串流之推論步驟移入 `asyncio.to_thread` 異步執行緒池，徹底解放 Sanic 主事件循環，確保 `/health` 與連線管理永遠流暢無阻塞。
+  - 實作每連線獨立之 `FireRedStreamVad` 狀態複製 (`conn_vad`)，杜絕多連線並行時語音活動檢測特徵快取污染。
 - **全端點 CORS 與 OPTIONS Preflight 跨域支援**：
   - 實作 Sanic `MethodNotAllowed` (405) 例外攔截器，當收到任意路徑之 `OPTIONS` 預檢請求時，統一回傳 `HTTP 204 No Content` 並附加完整 CORS 標頭 (`Access-Control-Allow-Origin: *`、`Access-Control-Allow-Methods: GET, POST, OPTIONS, PUT, DELETE`)。
   - 針對 `/transcribe`、`/transcribe/stream`、`/transcribe/cancel`、`/health` 端點明確支援 `OPTIONS` 方法，徹底解決 Vue/React 等第三方瀏覽器應用程式發起跨網域請求時被瀏覽器攔截的 CORS 阻擋問題。

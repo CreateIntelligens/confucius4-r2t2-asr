@@ -166,6 +166,7 @@ TRANSCRIBE_SEGMENT_SAMPLES = TRANSCRIBE_SEGMENT_SECONDS * 16000
 TRADITIONAL_CONVERTER = OpenCC("s2twp")
 ACTIVE_TRANSCRIPTION_JOBS: dict[str, threading.Event] = {}
 ACTIVE_TRANSCRIPTION_JOBS_LOCK = threading.Lock()
+ASR_INFER_LOCK = threading.Lock()
 
 
 class TranscriptionCancelled(Exception):
@@ -463,10 +464,12 @@ def _transcribe_audio_segment(
     for start in range(0, len(wav), step_samples):
         if cancel_event is not None and cancel_event.is_set():
             raise TranscriptionCancelled()
-        asr_model.streaming_transcribe(wav[start : start + step_samples], state, max_tokens)
+        with ASR_INFER_LOCK:
+            asr_model.streaming_transcribe(wav[start : start + step_samples], state, max_tokens)
     if cancel_event is not None and cancel_event.is_set():
         raise TranscriptionCancelled()
-    asr_model.finish_streaming_transcribe(state, max_tokens)
+    with ASR_INFER_LOCK:
+        asr_model.finish_streaming_transcribe(state, max_tokens)
     return _convert_output_text(state.text.split("|")[0].strip(), output_script)
 
 @app.route("/transcribe", methods=["POST", "OPTIONS"])
@@ -749,8 +752,17 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 chunk_size_sec=CHUNK_ASR_SECONDS,
             )
 
+            conn_vad = None
             if use_vad and stream_vad is not None:
-                stream_vad.reset()
+                try:
+                    import copy
+                    conn_vad = copy.copy(stream_vad)
+                    conn_vad.audio_feat = copy.deepcopy(stream_vad.audio_feat)
+                    conn_vad.postprocessor = copy.deepcopy(stream_vad.postprocessor)
+                    conn_vad.reset()
+                except Exception as e:
+                    logger.warning(f"Failed to clone VAD instance: {e}, using shared VAD")
+                    conn_vad = stream_vad
 
             max_new_tokens = max(1, int((step + lookahead) / 1280))
             max_new_tokens_floor = min(32, max(4, 2 * int(step / 1280)))
@@ -772,9 +784,12 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 if isinstance(data, str):
                     if data == YOUDAO_ONETIME_ASR_EOS_STRING:
                         first_max_new_tokens = max(1, int((step + lookahead) / 1280))
-                        text = asr_model.finish_streaming_transcribe_no_reset(
-                            asr_state, first_max_new_tokens
-                        )
+                        def _finish_transcribe():
+                            with ASR_INFER_LOCK:
+                                return asr_model.finish_streaming_transcribe_no_reset(
+                                    asr_state, first_max_new_tokens
+                                )
+                        text = await asyncio.to_thread(_finish_transcribe)
                         text = text.split("|")[0]
                         if len(text) > len(last_fixed_asr_text):
                             new_asr_text = text[len(last_fixed_asr_text):]
@@ -823,19 +838,23 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                     # Streaming VAD
                     speech_ended_in_this_chunk = False
                     vad_cost_ms = 0.0
-                    if use_vad and stream_vad is not None:
+                    if use_vad and conn_vad is not None:
                         audio_chunk_int16 = (audio_chunk * 32768.0).clip(-32768, 32767).astype(np.int16)
                         t0 = time.time()
-                        chunk_results = stream_vad.detect_chunk(audio_chunk_int16)
+                        chunk_results = conn_vad.detect_chunk(audio_chunk_int16)
                         for r in chunk_results:
                             if r.is_speech_end:
                                 speech_ended_in_this_chunk = True
                         vad_cost_ms = round((time.time() - t0) * 1000, 1)
 
+                    def _step_transcribe():
+                        with ASR_INFER_LOCK:
+                            return asr_model.streaming_transcribe_no_reset(
+                                audio_chunk, asr_state, int(max_new_tokens), False
+                            )
+
                     t0 = time.time()
-                    text, fixed_asr_text = asr_model.streaming_transcribe_no_reset(
-                        audio_chunk, asr_state, int(max_new_tokens), False
-                    )
+                    text, fixed_asr_text = await asyncio.to_thread(_step_transcribe)
                     fixed_asr_text = fixed_asr_text.split("|")[0]
                     asr_cost_ms = round((time.time() - t0) * 1000, 1)
 
@@ -901,9 +920,12 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 did_reset = False
                 if is_halluc:
                     logger.info(f"requestId={requestId}: hallucination reset, reason={halluc_reason}")
-                    text = asr_model.finish_streaming_transcribe_no_reset(
-                        asr_state, max(1, int((step + lookahead) / 1280))
-                    )
+                    def _finish_transcribe_halluc():
+                        with ASR_INFER_LOCK:
+                            return asr_model.finish_streaming_transcribe_no_reset(
+                                asr_state, max(1, int((step + lookahead) / 1280))
+                            )
+                    text = await asyncio.to_thread(_finish_transcribe_halluc)
                     text = text.split("|")[0]
                     if len(text) > len(last_fixed_asr_text):
                         new_asr_text = text[len(last_fixed_asr_text):]
