@@ -324,6 +324,15 @@ async def handle_index(request: Request):
         return await response.file(index_path)
     return response.text("Confucius4-R2T2 service running. Web UI not found.", status=404)
 
+@app.route("/llms.txt")
+async def handle_llms_txt(request: Request):
+    llms_path = os.path.join(WEB_DIR, "llms.txt")
+    if not os.path.exists(llms_path):
+        llms_path = os.path.join(CURRENT_DIR, "llms.txt")
+    if os.path.exists(llms_path):
+        return await response.file(llms_path, mime_type="text/plain; charset=utf-8")
+    return response.text("llms.txt not found", status=404)
+
 @app.route("/health")
 async def handle_health(request: Request):
     return response.json({

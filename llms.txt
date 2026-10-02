@@ -1,0 +1,220 @@
+# 333-R2T2-ASR (Confucius4-R2T2) API Documentation
+
+> 實時真流式語音辨識與即時字幕服務 (Real-time Streaming ASR Service)
+> 技術支援：david888.com
+> 核心模型：NetEase Youdao Confucius4-R2T2 (Qwen3-ASR-1.7B)
+> 服務端點：https://asr.5gao.ai （備用：https://147.5gao.ai，內網：http://10.9.0.35:8040）
+
+## 服務概述
+333-R2T2-ASR 採用網易有道開源之真流式語音大模型 Confucius4-R2T2，核心特色為最長穩定前綴（Longest Stable Prefix, LSP）演算法，具備文字只增不改、不回改、不幻覺補全之優良特性。
+
+提供兩種整合調用方式：
+1. **HTTP REST API**：音訊檔案單次上傳辨識（同步回傳或 SSE 逐段串流），單檔上限 200MB。
+2. **WebSocket (WSS) 串流 API**：極低延遲（<200ms）即時語音辨識，適用於直播字幕、會議即時紀錄、語音助理。
+
+---
+
+## 1. 健康檢查 (Health Check)
+檢查後端服務及 vLLM 模型載入狀態。
+
+- **URL**: `https://asr.5gao.ai/health`
+- **Method**: `GET`
+- **Response**:
+```json
+{
+  "status": "healthy",
+  "service": "Confucius4-R2T2",
+  "active_connections": 0,
+  "gpu_mem_util": "0.40",
+  "model_loaded": true
+}
+```
+
+---
+
+## 2. HTTP 音訊檔案單次轉寫 (Audio File Transcription)
+將本機音檔上傳至伺服器進行單次完整轉寫。
+
+- **URL**: `https://asr.5gao.ai/transcribe`
+- **Method**: `POST`
+- **Content-Type**: `multipart/form-data`
+- **請求參數 (Form Fields)**:
+  - `file` (必填, Binary): 音訊檔案（支援 WAV, MP3, FLAC, M4A, OGG）
+  - `language` (選填, string): `auto`（預設）、`zh`（中文）、`en`（英文）
+  - `hotwords` (選填, string): 專有名詞或自訂熱詞（以空白或逗號分隔）
+  - `output_format` (選填, string): `traditional`（繁體中文，預設）、`simplified`（簡體中文）
+
+### cURL 範例
+```bash
+curl -X POST https://asr.5gao.ai/transcribe \
+  -F "file=@/path/to/meeting.mp3" \
+  -F "language=auto" \
+  -F "output_format=traditional" \
+  -F "hotwords=Confucius4 R2T2 Qwen3"
+```
+
+### Python 範例
+```python
+import requests
+
+url = "https://asr.5gao.ai/transcribe"
+files = {"file": open("meeting.mp3", "rb")}
+data = {
+    "language": "auto",
+    "output_format": "traditional",
+    "hotwords": "Confucius4 R2T2"
+}
+
+resp = requests.post(url, files=files, data=data, timeout=300)
+result = resp.json()
+print("辨識文字:", result.get("text"))
+print("音訊時長:", result.get("duration"), "秒")
+print("推論耗時:", result.get("cost_ms"), "ms")
+```
+
+---
+
+## 3. HTTP 長音檔逐段串流轉寫 (Streaming Segments via SSE)
+長音檔建議使用此端點。後端每 30 秒分段獨立解碼，並透過 Server-Sent Events (SSE) 即時回傳每段的時間戳與字幕，避免長時間等待。
+
+- **URL**: `https://asr.5gao.ai/transcribe/stream`
+- **Method**: `POST`
+- **Content-Type**: `multipart/form-data`
+- **請求參數 (Form Fields)**:
+  - `file` (必填, Binary): 完整長音檔
+  - `task_id` (選填, string): 自訂任務 ID（若未提供，後端自動生成 UUID）
+  - `language` (選填, string): `auto` | `zh` | `en`
+  - `output_format` (選填, string): `traditional` | `simplified`
+  - `hotwords` (選填, string): 熱詞
+
+### SSE 事件回傳格式
+```
+event: init
+data: {"task_id": "c1f7b0a8-...", "filename": "lecture.mp3"}
+
+event: segment
+data: {"task_id": "c1f7b0a8-...", "index": 0, "start_time": 0.0, "end_time": 30.0, "text": "各位聽眾大家好...", "duration": 30.0, "done": false}
+
+event: done
+data: {"task_id": "c1f7b0a8-...", "total_segments": 10, "duration": 298.5, "text": "完整全文..."}
+```
+
+---
+
+## 4. 取消轉寫任務 (Cancel Ongoing Transcription)
+停止正在進行中的音檔分段辨識，並保留已完成之分段。
+
+- **URL**: `https://asr.5gao.ai/transcribe/cancel`
+- **Method**: `POST`
+- **Content-Type**: `application/json`
+- **Request Body**:
+```json
+{
+  "task_id": "c1f7b0a8-..."
+}
+```
+- **Response**:
+```json
+{
+  "success": true,
+  "task_id": "c1f7b0a8-...",
+  "cancelled": true
+}
+```
+
+---
+
+## 5. WebSocket 實時流式語音辨識 (Low-Latency Streaming WSS)
+專為即時麥克風串流或直播推流設計。
+
+- **URL**: `wss://asr.5gao.ai/asr_stream_api_v1`
+- **音訊格式規範**:
+  - 取樣率 (Sample Rate): `16000` Hz (16kHz)
+  - 取樣深度 (Bit Depth): `16-bit` signed integer (PCM s16le)
+  - 聲道數 (Channels): `1` (Mono 單聲道)
+  - 建議傳輸區塊: 每 `160ms` 一塊（5120 bytes 二進位原始數據）
+
+### 通訊協定流程：
+1. **建立連線後，客戶端發送握手 JSON 訊息**：
+```json
+{
+  "api_key": "test0102",
+  "sample_rate": 16000,
+  "language": "auto",
+  "hotwords": "Confucius4 R2T2",
+  "output_format": "traditional"
+}
+```
+2. **後端確認握手**：
+```json
+{
+  "status": "ready",
+  "session_id": "8a329d91-..."
+}
+```
+3. **客戶端連續發送二進位音訊 (Binary PCM Chunks)**：
+   每次發送 5120 bytes 原始 PCM 數據。
+4. **後端實時推播增量字幕 (Delta Text)**：
+```json
+{
+  "text": "即時辨識文字增量",
+  "is_final": false,
+  "cost_ms": 14,
+  "total_cost_ms": 110
+}
+```
+5. **結束連線**：客戶端發送 `{"action": "finish"}` 或關閉 WebSocket 連線。
+
+### Python WebSocket 完整調用範例
+```python
+import asyncio
+import json
+import websockets
+
+async def stream_mic_or_file():
+    uri = "wss://asr.5gao.ai/asr_stream_api_v1"
+    async with websockets.connect(uri) as ws:
+        # 1. 握手設定
+        handshake = {
+            "api_key": "test0102",
+            "sample_rate": 16000,
+            "language": "auto",
+            "output_format": "traditional",
+            "hotwords": "david888"
+        }
+        await ws.send(json.dumps(handshake))
+        ready_res = await ws.recv()
+        print("連線狀態:", ready_res)
+
+        # 2. 異步接收辨識文字
+        async def receive_loop():
+            try:
+                async for msg in ws:
+                    data = json.loads(msg)
+                    if "text" in data and data["text"]:
+                        print(data["text"], end="", flush=True)
+            except websockets.exceptions.ConnectionClosed:
+                pass
+
+        recv_task = asyncio.create_task(receive_loop())
+
+        # 3. 連續發送 16kHz PCM 音訊切片（每切片 160ms = 5120 bytes）
+        with open("sample_16k.pcm", "rb") as f:
+            while chunk := f.read(5120):
+                await ws.send(chunk)
+                await asyncio.sleep(0.16)
+
+        # 4. 通知結束
+        await ws.send(json.dumps({"action": "finish"}))
+        await recv_task
+
+if __name__ == "__main__":
+    asyncio.run(stream_mic_or_file())
+```
+
+---
+
+## 聯絡與技術支援
+- **技術提供**：[david888.com](https://david888.com)
+- **站點首頁**：[https://asr.5gao.ai/](https://asr.5gao.ai/)
+- **服務名稱**：333-R2T2-ASR
