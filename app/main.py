@@ -340,6 +340,14 @@ def serve_index():
     return {"status": "ok", "service": "Confucius4-R2T2 ASR Service"}
 
 
+@app.get("/llms.txt")
+def serve_llms_txt():
+    path = os.path.join(_web_dir(), "llms.txt")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="llms.txt not found")
+    return FileResponse(path, media_type="text/plain; charset=utf-8")
+
+
 if os.path.isdir(os.path.join(_web_dir(), "assets")):
     app.mount("/assets", StaticFiles(directory=os.path.join(_web_dir(), "assets")), name="web_assets")
 

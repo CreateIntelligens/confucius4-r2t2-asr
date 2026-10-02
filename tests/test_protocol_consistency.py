@@ -95,3 +95,27 @@ def test_both_servers_accept_the_same_output_scripts():
         assert f'"{script}"' in server
         assert f'value="{script}"' in read("web/index.html")
     assert 'OpenCC("s2twp")' in server and 'OpenCC("s2twp")' in read("app/script_convert.py")
+
+
+def test_both_servers_map_language_codes_the_same_way():
+    """server.py and app/main.py each carry a language table; they must agree,
+    including the deliberate choice that zhen means Chinese rather than auto."""
+    import ast
+
+    from textproc import normalize_language
+
+    source = read("server.py")
+    table = ast.literal_eval(re.search(r"^_LANG_MAP = (\{.*?^\})", source, flags=re.M | re.S).group(1))
+    assert table["zhen"] == "Chinese"
+    for code, expected in table.items():
+        assert normalize_language(code) == expected, code
+    # a stream header without a language is treated as zhen by both
+    assert 'normalize_asr_language(header.get("language") or "zhen")' in source
+    assert normalize_language(None, "zhen") == "Chinese"
+
+
+def test_both_servers_serve_llms_txt():
+    assert '@app.route("/llms.txt")' in read("server.py")
+    assert '@app.get("/llms.txt")' in read("app/main.py")
+    assert 'href="/llms.txt"' in read("web/index.html")
+    assert read("llms.txt") == read("web/llms.txt")

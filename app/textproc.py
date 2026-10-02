@@ -27,8 +27,19 @@ _LANGUAGE_ALIASES = {
     "en": "English",
     "cantonese": "Cantonese",
     "yue": "Cantonese",
+    "japanese": "Japanese",
+    "ja": "Japanese",
+    "korean": "Korean",
+    "ko": "Korean",
+    "french": "French",
+    "fr": "French",
+    "german": "German",
+    "de": "German",
+    "spanish": "Spanish",
+    "es": "Spanish",
 }
-AUTO_LANGUAGE = "auto"
+# 明確要求自動判斷的寫法
+AUTO_LANGUAGES = ("auto", "none")
 
 
 def normalize_language(
@@ -43,7 +54,7 @@ def normalize_language(
     raw = str(language).strip() if language is not None else ""
     if not raw:
         raw = default or ""
-    if not raw or raw.lower() == AUTO_LANGUAGE:
+    if not raw or raw.lower() in AUTO_LANGUAGES:
         return None
     low = raw.lower()
     if low in _LANGUAGE_ALIASES:
