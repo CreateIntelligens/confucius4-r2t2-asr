@@ -167,18 +167,29 @@ TRANSCRIBE_SEGMENT_SAMPLES = TRANSCRIBE_SEGMENT_SECONDS * 16000
 TRADITIONAL_CONVERTER = OpenCC("s2twp")
 ACTIVE_TRANSCRIPTION_JOBS: dict[str, threading.Event] = {}
 ACTIVE_TRANSCRIPTION_JOBS_LOCK = threading.Lock()
-ASR_INFER_LOCK = threading.Lock()
-
-def _safe_resolve(future, result):
+def _safe_resolve(future: asyncio.Future, result):
     if not future.done():
         future.set_result(result)
 
-def _safe_reject(future, exc):
+def _safe_reject(future: asyncio.Future, exc: Exception):
     if not future.done():
         future.set_exception(exc)
 
+def _safe_cancel(future: asyncio.Future):
+    if not future.done():
+        future.cancel()
+
+def _dispatch_to_loop(loop: asyncio.AbstractEventLoop, fn, *args):
+    if loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(fn, *args)
+    except RuntimeError:
+        pass
+
+
 class InferenceTask:
-    __slots__ = ("func", "args", "kwargs", "priority", "future", "loop")
+    __slots__ = ("func", "args", "kwargs", "priority", "future", "loop", "cancelled_event")
     def __init__(self, func, args, kwargs, priority, future, loop):
         self.func = func
         self.args = args
@@ -186,19 +197,40 @@ class InferenceTask:
         self.priority = priority
         self.future = future
         self.loop = loop
+        self.cancelled_event = threading.Event()
 
-class InferenceScheduler:
+
+class FairInferenceScheduler:
     """
     Dedicated ASR Inference Pipeline Scheduler (Worker-Dispatcher Model).
-    Serializes GPU interactions through a single dedicated worker thread,
-    preventing vLLM IPC queue desynchronization and race conditions while
-    providing priority scheduling (Live WebSocket = High Priority 0, HTTP Upload = Normal Priority 1).
+    Uses Deficit Round-Robin (DRR) Dual-Queue to balance:
+      - Live WebSocket requests (Priority 0)
+      - Batch HTTP File requests (Priority 1)
+    Guarantees that after at most MAX_LIVE_BURST live chunks, 1 batch chunk is processed,
+    preventing starvation of batch transcriptions during continuous live streaming.
     """
-    def __init__(self, maxsize=500):
-        self.queue = queue.PriorityQueue(maxsize=maxsize)
-        self._counter = 0
-        self._worker_thread = None
+    MAX_LIVE_BURST = 6
+
+    def __init__(self, maxsize: int = 500):
+        self.live_queue = queue.Queue(maxsize=maxsize)
+        self.batch_queue = queue.Queue(maxsize=maxsize)
+        self._worker_thread: Optional[threading.Thread] = None
         self._running = False
+        self._consecutive_live = 0
+
+    @property
+    def qsize(self) -> int:
+        return self.live_queue.qsize() + self.batch_queue.qsize()
+
+    class _QueueProxy:
+        def __init__(self, scheduler):
+            self._s = scheduler
+        def qsize(self):
+            return self._s.qsize
+
+    @property
+    def queue(self):
+        return self._QueueProxy(self)
 
     def start(self):
         if self._running:
@@ -208,43 +240,79 @@ class InferenceScheduler:
             target=self._worker_loop, daemon=True, name="ASRInferenceWorker"
         )
         self._worker_thread.start()
-        logger.info("✅ InferenceScheduler worker started")
+        logger.info("✅ FairInferenceScheduler worker started")
 
     def stop(self):
         self._running = False
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=3.0)
+        self._drain_queues_on_shutdown()
 
-    def submit(self, func, *args, priority=0, **kwargs):
+    def _drain_queues_on_shutdown(self):
+        exc = RuntimeError("Server is shutting down; task aborted")
+        for q in (self.live_queue, self.batch_queue):
+            while not q.empty():
+                try:
+                    task = q.get_nowait()
+                    _dispatch_to_loop(task.loop, _safe_reject, task.future, exc)
+                except queue.Empty:
+                    break
+
+    async def submit(self, func, *args, priority: int = 0, **kwargs):
+        if not self._running:
+            raise RuntimeError("Inference scheduler is not running")
+
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        self._counter += 1
         task = InferenceTask(func, args, kwargs, priority, future, loop)
+        target_queue = self.live_queue if priority == 0 else self.batch_queue
+
         try:
-            self.queue.put_nowait((priority, self._counter, task))
+            target_queue.put_nowait(task)
         except queue.Full:
-            future.set_exception(RuntimeError("ASR inference queue is full"))
-        return future
+            raise RuntimeError(f"ASR inference queue (priority {priority}) is full")
+
+        try:
+            return await future
+        except asyncio.CancelledError:
+            task.cancelled_event.set()
+            _dispatch_to_loop(loop, _safe_cancel, future)
+            raise
+
+    def _get_next_task(self) -> Optional[InferenceTask]:
+        # DRR Dequeue Policy: prevent starvation of batch queue
+        if self._consecutive_live >= self.MAX_LIVE_BURST and not self.batch_queue.empty():
+            self._consecutive_live = 0
+            return self.batch_queue.get_nowait()
+
+        if not self.live_queue.empty():
+            self._consecutive_live += 1
+            return self.live_queue.get_nowait()
+
+        if not self.batch_queue.empty():
+            self._consecutive_live = 0
+            return self.batch_queue.get_nowait()
+
+        return None
 
     def _worker_loop(self):
         while self._running:
-            try:
-                priority, counter, task = self.queue.get(timeout=0.2)
-            except queue.Empty:
+            task = self._get_next_task()
+            if task is None:
+                time.sleep(0.005)
                 continue
 
-            if task.future.cancelled():
-                self.queue.task_done()
+            # Thread-safe cancellation check: skip execution if client disconnected
+            if task.cancelled_event.is_set():
                 continue
 
             try:
-                with ASR_INFER_LOCK:
-                    result = task.func(*task.args, **task.kwargs)
-                task.loop.call_soon_threadsafe(_safe_resolve, task.future, result)
+                result = task.func(*task.args, **task.kwargs)
+                _dispatch_to_loop(task.loop, _safe_resolve, task.future, result)
             except Exception as e:
-                task.loop.call_soon_threadsafe(_safe_reject, task.future, e)
-            finally:
-                self.queue.task_done()
+                _dispatch_to_loop(task.loop, _safe_reject, task.future, e)
 
-inference_scheduler = InferenceScheduler()
+inference_scheduler = FairInferenceScheduler()
 
 
 class TranscriptionCancelled(Exception):
@@ -264,6 +332,8 @@ UNFIX_TOKEN_NUM = 1
 MAX_TOKENS = 10
 ERROR_MSG_NO_HEADER = "json header is expected"
 MAX_SYSTEM_PROMPT_CHARS = 4000
+MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "12"))
+MAX_CONTINUOUS_SPEECH_SEC = float(os.environ.get("MAX_CONTINUOUS_SPEECH_SEC", "25.0"))
 
 def resolve_system_prompt(header):
     if "system_prompt" not in header:
@@ -394,12 +464,17 @@ async def on_server_stop(app, loop):
     inference_scheduler.stop()
 
 def read_pcm(pcm_byte_data, is_wav=False):
-    pcm_data = np.frombuffer(pcm_byte_data, dtype=np.int16, offset=44 if is_wav else 0)
-    res = pcm_data / (2 ** 15)
+    offset = 44 if (is_wav and len(pcm_byte_data) >= 44) else 0
+    usable_len = len(pcm_byte_data) - offset
+    usable_len -= (usable_len % 2)
+    if usable_len <= 0:
+        return np.empty((0,), dtype=np.float32)
+    pcm_data = np.frombuffer(pcm_byte_data, dtype=np.int16, count=usable_len // 2, offset=offset)
+    res = pcm_data / 32768.0
     return res.astype(np.float32)
 
 def if_contains_wav_header(byte_array):
-    if len(byte_array) < 12: return False
+    if len(byte_array) < 44: return False
     return byte_array[0:4] == b'RIFF' and byte_array[8:12] == b'WAVE'
 
 def validate_header(header):
@@ -815,6 +890,11 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 await ws.close(code=4401, reason="Unauthorized")
                 return
 
+            if active_connections >= MAX_CONCURRENT_STREAMS:
+                logger.warning(f"Rejecting WS connection: max concurrent streams ({MAX_CONCURRENT_STREAMS}) reached")
+                await ws.close(code=1013, reason="Server busy: max streaming capacity reached")
+                return
+
             context = resolve_qwen_context(header, smooth)
             active_connections += 1
             counted = True
@@ -846,8 +926,8 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                     conn_vad.postprocessor = copy.deepcopy(stream_vad.postprocessor)
                     conn_vad.reset()
                 except Exception as e:
-                    logger.warning(f"Failed to clone VAD instance: {e}, using shared VAD")
-                    conn_vad = stream_vad
+                    logger.error(f"Failed to clone VAD instance: {e}. Running without VAD to prevent cross-connection state corruption.")
+                    conn_vad = None
 
             max_new_tokens = max(1, int((step + lookahead) / 1280))
             max_new_tokens_floor = min(32, max(4, 2 * int(step / 1280)))
@@ -920,17 +1000,22 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                         tmp_audio_pointer += CHUNK_ASR_SIZE
                         total_secs += CHUNK_ASR_SECONDS
 
-                    # Streaming VAD
+                    # Streaming VAD (offloaded to thread to never block Sanic event loop)
                     speech_ended_in_this_chunk = False
                     vad_cost_ms = 0.0
                     if use_vad and conn_vad is not None:
                         audio_chunk_int16 = (audio_chunk * 32768.0).clip(-32768, 32767).astype(np.int16)
                         t0 = time.time()
-                        chunk_results = conn_vad.detect_chunk(audio_chunk_int16)
+                        chunk_results = await asyncio.to_thread(conn_vad.detect_chunk, audio_chunk_int16)
                         for r in chunk_results:
                             if r.is_speech_end:
                                 speech_ended_in_this_chunk = True
                         vad_cost_ms = round((time.time() - t0) * 1000, 1)
+
+                    # Continuous speech limit: prevent vLLM max_model_len overflow
+                    if total_secs >= MAX_CONTINUOUS_SPEECH_SEC:
+                        logger.info(f"requestId={requestId}: max continuous speech ({MAX_CONTINUOUS_SPEECH_SEC}s) reached, forcing segmentation reset")
+                        speech_ended_in_this_chunk = True
 
                     t0 = time.time()
                     text, fixed_asr_text = await inference_scheduler.submit(
@@ -971,8 +1056,8 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                         is_halluc = True
                         halluc_reason = cur_reason
 
-                    # Speech end / VAD pause
-                    if speech_ended_in_this_chunk and use_vad:
+                    # Speech end / VAD pause / Max continuous speech reset
+                    if speech_ended_in_this_chunk and (use_vad or total_secs >= MAX_CONTINUOUS_SPEECH_SEC):
                         seg_final_text = asr_state.text.split("|")[0]
                         asr_state = asr_model.init_streaming_state(
                             context=context,
@@ -987,6 +1072,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                             seg_new_asr_text = ""
                         out_msg = {"text": seg_new_asr_text, "reset": True, "asr_cost_ms": asr_cost_ms}
                         last_fixed_asr_text = ""
+                        total_secs = 0.0
 
                     out_msg["total_cost_ms"] = round(vad_cost_ms + asr_cost_ms, 1)
                     out_msg["text"] = _convert_output_text(out_msg.get("text", ""), output_script)
@@ -1041,15 +1127,21 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
 
         except Exception as e:
             logger.exception(f"requestId={requestId} error: {e}")
-        finally:
-            if counted:
-                active_connections -= 1
-            try:
-                await ws.close()
-            except Exception:
-                pass
 
-    await asyncio.gather(receiver(), processor())
+    recv_task = asyncio.create_task(receiver())
+    proc_task = asyncio.create_task(processor())
+    try:
+        done, pending = await asyncio.wait([recv_task, proc_task], return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        if counted:
+            active_connections = max(0, active_connections - 1)
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 def args_parser():
     parser = argparse.ArgumentParser(description='Confucius4-R2T2 Server')
