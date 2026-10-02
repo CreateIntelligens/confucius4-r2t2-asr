@@ -1159,6 +1159,11 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 proc_task.cancel()
                 await asyncio.gather(proc_task, return_exceptions=True)
+    except asyncio.CancelledError:
+        recv_task.cancel()
+        proc_task.cancel()
+        await asyncio.gather(recv_task, proc_task, return_exceptions=True)
+        raise
     finally:
         if counted:
             active_connections = max(0, active_connections - 1)
