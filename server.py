@@ -214,6 +214,37 @@ def resolve_qwen_context(header, smooth):
         context_parts.append(system_prompt)
     return "\n".join(context_parts)
 
+_LANG_MAP = {
+    "auto": None,
+    "none": None,
+    "zhen": None,
+    "": None,
+    "zh": "Chinese",
+    "chinese": "Chinese",
+    "en": "English",
+    "english": "English",
+    "yue": "Cantonese",
+    "cantonese": "Cantonese",
+    "ja": "Japanese",
+    "japanese": "Japanese",
+    "ko": "Korean",
+    "korean": "Korean",
+    "fr": "French",
+    "french": "French",
+    "de": "German",
+    "german": "German",
+    "es": "Spanish",
+    "spanish": "Spanish",
+}
+
+def normalize_asr_language(lang: Optional[str]) -> Optional[str]:
+    if not lang:
+        return None
+    val = str(lang).strip().lower()
+    if val in _LANG_MAP:
+        return _LANG_MAP[val]
+    return str(lang).strip().capitalize()
+
 asr_model = None
 stream_vad = None
 
@@ -413,12 +444,7 @@ async def handle_transcribe(request: Request):
 
         def run_infer():
             t0 = time.time()
-            lang_param = None
-            if language:
-                if language.lower() in ("chinese", "zh", "zhen"):
-                    lang_param = "Chinese"
-                elif language.lower() in ("english", "en"):
-                    lang_param = "English"
+            lang_param = normalize_asr_language(language)
 
             segment_texts = []
             for start in range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES):
@@ -477,12 +503,7 @@ async def handle_transcribe_stream(request: Request):
         logger.exception(f"Audio decode error: {e}")
         return response.json({"status": "error", "message": "無法讀取音訊檔案，請確認檔案格式後重試。"}, status=400)
 
-    lang_param = None
-    if language:
-        if language.lower() in ("chinese", "zh", "zhen"):
-            lang_param = "Chinese"
-        elif language.lower() in ("english", "en"):
-            lang_param = "English"
+    lang_param = normalize_asr_language(language)
 
     duration_sec = len(wav) / 16000.0
     total_segments = max(1, (len(wav) + TRANSCRIBE_SEGMENT_SAMPLES - 1) // TRANSCRIBE_SEGMENT_SAMPLES)
@@ -632,9 +653,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
 
             requestId = header.get("requestId", None)
             use_vad = header.get("use_vad", True)
-            language = header.get("language", "zhen")
-            if language == "zhen":
-                language = None
+            language = normalize_asr_language(header.get("language", None))
             output_script = header.get("output_script", "simplified")
             if output_script not in ("traditional", "simplified"):
                 output_script = "simplified"
