@@ -18,6 +18,12 @@ Versions are categorized by date (`YYYY-MM-DD`).
 - **CI/CD 自動化部屬管線 (GitHub Actions & Self-hosted Runner)**：
   - 於主機 `10.9.0.35` 註冊系統級守護進程 `actions.runner.CreateIntelligens-confucius4-r2t2-asr.virtualhumantest-r2t2.service`。
   - 建立 `.github/workflows/deploy-ghcr.yml` 與 `Dockerfile.ghcr`，提交至 `main` 分支時自動建置映像發布至 GHCR，並由主機自動拉取部署、平滑重啟 `confucius4-r2t2.service` 與執行 `/health` 健康檢查，異常時具備自動回滾能力。
+- **微批優先級排程調度器 (Option A: InferenceScheduler Priority Queue)**：
+  - 徹底重構 GPU 推論排程架構，以單一專屬推論工作線程 (`ASRInferenceWorker`) 搭配優先級隊列 (`queue.PriorityQueue`)，徹底消除多線程直接調用 vLLM 底層 IPC ZeroMQ 造成的跨進程 Futex 互鎖死鎖。
+  - 雙軌優先級：WebSocket 實時語音享受最高優先級 (`priority=0`)，HTTP 大檔轉寫微切片使用普通優先級 (`priority=1`)，實時說話可在每 320ms 微切片間隙（約 15ms）立即插隊，維持 15~30ms 極致即時響應且永不衝突。
+  - 非阻塞非同步橋接：採用 `call_soon_threadsafe` 將推論結果安全回傳給 Sanic 協程，高吞吐事件循環無阻塞。
+  - 於 `GET /health` 端點新增 `"queue_size"` 即時排隊深度監控。
+  - 於 `README.md` 詳盡記錄高並發架構演進評估（方案 A 微批調度、方案 B 進程級雙實例隔離、方案 C 原生 AsyncLLMEngine 動態合批）。
 - **品牌識別與 Open Graph 社交卡片**：
   - 於網頁底部加入「技術提供 david888.com | llms.txt」精緻連結（OBS 直播模式下自動隱藏）。
   - 設計並產出標準 1200×630 尺寸 Open Graph 社群分享圖 (`web/assets/og-image.png`，524KB) 與社交 Meta 標籤。

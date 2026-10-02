@@ -15,6 +15,7 @@ import logging
 import argparse
 import traceback
 import threading
+import queue
 import numpy as np
 from typing import Optional
 
@@ -168,6 +169,83 @@ ACTIVE_TRANSCRIPTION_JOBS: dict[str, threading.Event] = {}
 ACTIVE_TRANSCRIPTION_JOBS_LOCK = threading.Lock()
 ASR_INFER_LOCK = threading.Lock()
 
+def _safe_resolve(future, result):
+    if not future.done():
+        future.set_result(result)
+
+def _safe_reject(future, exc):
+    if not future.done():
+        future.set_exception(exc)
+
+class InferenceTask:
+    __slots__ = ("func", "args", "kwargs", "priority", "future", "loop")
+    def __init__(self, func, args, kwargs, priority, future, loop):
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+        self.priority = priority
+        self.future = future
+        self.loop = loop
+
+class InferenceScheduler:
+    """
+    Dedicated ASR Inference Pipeline Scheduler (Worker-Dispatcher Model).
+    Serializes GPU interactions through a single dedicated worker thread,
+    preventing vLLM IPC queue desynchronization and race conditions while
+    providing priority scheduling (Live WebSocket = High Priority 0, HTTP Upload = Normal Priority 1).
+    """
+    def __init__(self, maxsize=500):
+        self.queue = queue.PriorityQueue(maxsize=maxsize)
+        self._counter = 0
+        self._worker_thread = None
+        self._running = False
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop, daemon=True, name="ASRInferenceWorker"
+        )
+        self._worker_thread.start()
+        logger.info("✅ InferenceScheduler worker started")
+
+    def stop(self):
+        self._running = False
+
+    def submit(self, func, *args, priority=0, **kwargs):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._counter += 1
+        task = InferenceTask(func, args, kwargs, priority, future, loop)
+        try:
+            self.queue.put_nowait((priority, self._counter, task))
+        except queue.Full:
+            future.set_exception(RuntimeError("ASR inference queue is full"))
+        return future
+
+    def _worker_loop(self):
+        while self._running:
+            try:
+                priority, counter, task = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if task.future.cancelled():
+                self.queue.task_done()
+                continue
+
+            try:
+                with ASR_INFER_LOCK:
+                    result = task.func(*task.args, **task.kwargs)
+                task.loop.call_soon_threadsafe(_safe_resolve, task.future, result)
+            except Exception as e:
+                task.loop.call_soon_threadsafe(_safe_reject, task.future, e)
+            finally:
+                self.queue.task_done()
+
+inference_scheduler = InferenceScheduler()
+
 
 class TranscriptionCancelled(Exception):
     pass
@@ -307,6 +385,14 @@ async def initialize_models(app):
         asr_model.finish_streaming_transcribe(_warmup_state, _warmup_max_new_tokens)
     logger.info("✅ ASR model warmup complete")
 
+@app.listener('after_server_start')
+async def on_server_start(app, loop):
+    inference_scheduler.start()
+
+@app.listener('before_server_stop')
+async def on_server_stop(app, loop):
+    inference_scheduler.stop()
+
 def read_pcm(pcm_byte_data, is_wav=False):
     pcm_data = np.frombuffer(pcm_byte_data, dtype=np.int16, offset=44 if is_wav else 0)
     res = pcm_data / (2 ** 15)
@@ -421,6 +507,7 @@ async def handle_health(request: Request):
         "status": "healthy",
         "service": "Confucius4-R2T2",
         "active_connections": active_connections,
+        "queue_size": inference_scheduler.queue.qsize(),
         "gpu_mem_util": args.gpu_mem_util,
         "model_loaded": asr_model is not None
     })
@@ -445,7 +532,7 @@ def _decode_audio_bytes(content: bytes) -> np.ndarray:
     return wav.astype(np.float32)
 
 
-def _transcribe_audio_segment(
+async def _transcribe_audio_segment(
     wav: np.ndarray,
     context: str,
     language: Optional[str],
@@ -464,12 +551,15 @@ def _transcribe_audio_segment(
     for start in range(0, len(wav), step_samples):
         if cancel_event is not None and cancel_event.is_set():
             raise TranscriptionCancelled()
-        with ASR_INFER_LOCK:
-            asr_model.streaming_transcribe(wav[start : start + step_samples], state, max_tokens)
+        chunk = wav[start : start + step_samples]
+        await inference_scheduler.submit(
+            asr_model.streaming_transcribe, chunk, state, max_tokens, priority=1
+        )
     if cancel_event is not None and cancel_event.is_set():
         raise TranscriptionCancelled()
-    with ASR_INFER_LOCK:
-        asr_model.finish_streaming_transcribe(state, max_tokens)
+    await inference_scheduler.submit(
+        asr_model.finish_streaming_transcribe, state, max_tokens, priority=1
+    )
     return _convert_output_text(state.text.split("|")[0].strip(), output_script)
 
 @app.route("/transcribe", methods=["POST", "OPTIONS"])
@@ -497,24 +587,20 @@ async def handle_transcribe(request: Request):
     try:
         wav = await asyncio.to_thread(_decode_audio_bytes, file.body)
         duration_sec = round(len(wav) / 16000.0, 2)
+        t0 = time.time()
+        lang_param = normalize_asr_language(language)
 
-        def run_infer():
-            t0 = time.time()
-            lang_param = normalize_asr_language(language)
+        segment_texts = []
+        for start in range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES):
+            segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
+            text = await _transcribe_audio_segment(segment, context or "", lang_param, output_script)
+            if text:
+                segment_texts.append(text)
+        cost_ms = round((time.time() - t0) * 1000, 1)
 
-            segment_texts = []
-            for start in range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES):
-                segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
-                text = _transcribe_audio_segment(segment, context or "", lang_param, output_script)
-                if text:
-                    segment_texts.append(text)
-            cost_ms = round((time.time() - t0) * 1000, 1)
-            return "\n".join(segment_texts), cost_ms
-
-        text, cost_ms = await asyncio.to_thread(run_infer)
         return response.json({
             "status": "success",
-            "text": text,
+            "text": "\n".join(segment_texts),
             "duration_sec": duration_sec,
             "cost_ms": cost_ms,
         })
@@ -615,8 +701,7 @@ async def handle_transcribe_stream(request: Request):
 
             segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
             try:
-                text = await asyncio.to_thread(
-                    _transcribe_audio_segment,
+                text = await _transcribe_audio_segment(
                     segment,
                     context or "",
                     lang_param,
@@ -784,12 +869,12 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 if isinstance(data, str):
                     if data == YOUDAO_ONETIME_ASR_EOS_STRING:
                         first_max_new_tokens = max(1, int((step + lookahead) / 1280))
-                        def _finish_transcribe():
-                            with ASR_INFER_LOCK:
-                                return asr_model.finish_streaming_transcribe_no_reset(
-                                    asr_state, first_max_new_tokens
-                                )
-                        text = await asyncio.to_thread(_finish_transcribe)
+                        text = await inference_scheduler.submit(
+                            asr_model.finish_streaming_transcribe_no_reset,
+                            asr_state,
+                            first_max_new_tokens,
+                            priority=0,
+                        )
                         text = text.split("|")[0]
                         if len(text) > len(last_fixed_asr_text):
                             new_asr_text = text[len(last_fixed_asr_text):]
@@ -847,14 +932,15 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                                 speech_ended_in_this_chunk = True
                         vad_cost_ms = round((time.time() - t0) * 1000, 1)
 
-                    def _step_transcribe():
-                        with ASR_INFER_LOCK:
-                            return asr_model.streaming_transcribe_no_reset(
-                                audio_chunk, asr_state, int(max_new_tokens), False
-                            )
-
                     t0 = time.time()
-                    text, fixed_asr_text = await asyncio.to_thread(_step_transcribe)
+                    text, fixed_asr_text = await inference_scheduler.submit(
+                        asr_model.streaming_transcribe_no_reset,
+                        audio_chunk,
+                        asr_state,
+                        int(max_new_tokens),
+                        False,
+                        priority=0,
+                    )
                     fixed_asr_text = fixed_asr_text.split("|")[0]
                     asr_cost_ms = round((time.time() - t0) * 1000, 1)
 
@@ -920,12 +1006,12 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                 did_reset = False
                 if is_halluc:
                     logger.info(f"requestId={requestId}: hallucination reset, reason={halluc_reason}")
-                    def _finish_transcribe_halluc():
-                        with ASR_INFER_LOCK:
-                            return asr_model.finish_streaming_transcribe_no_reset(
-                                asr_state, max(1, int((step + lookahead) / 1280))
-                            )
-                    text = await asyncio.to_thread(_finish_transcribe_halluc)
+                    text = await inference_scheduler.submit(
+                        asr_model.finish_streaming_transcribe_no_reset,
+                        asr_state,
+                        max(1, int((step + lookahead) / 1280)),
+                        priority=0,
+                    )
                     text = text.split("|")[0]
                     if len(text) > len(last_fixed_asr_text):
                         new_asr_text = text[len(last_fixed_asr_text):]
