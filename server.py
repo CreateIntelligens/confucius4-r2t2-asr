@@ -348,6 +348,37 @@ secret_key_list = ["test0102"]
 WEB_DIR = os.path.join(CURRENT_DIR, "web")
 app.static("/assets", os.path.join(WEB_DIR, "assets"), name="web_assets")
 
+# CORS Middleware & Preflight Handlers
+@app.middleware("response")
+async def add_cors_headers(request: Request, response_obj):
+    if response_obj:
+        response_obj.headers["Access-Control-Allow-Origin"] = "*"
+        response_obj.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
+        response_obj.headers["Access-Control-Allow-Headers"] = "*"
+        response_obj.headers["Access-Control-Max-Age"] = "86400"
+
+@app.options("/<path:path>")
+async def handle_options_all(request: Request, path: str = ""):
+    return response.empty(
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
+
+@app.options("/")
+async def handle_options_root(request: Request):
+    return response.empty(
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
+
 @app.route("/")
 async def handle_index(request: Request):
     index_path = os.path.join(WEB_DIR, "index.html")
@@ -509,7 +540,11 @@ async def handle_transcribe_stream(request: Request):
     total_segments = max(1, (len(wav) + TRANSCRIBE_SEGMENT_SAMPLES - 1) // TRANSCRIBE_SEGMENT_SAMPLES)
     stream = await request.respond(
         content_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
     )
 
     def send_event(payload: dict) -> str:
