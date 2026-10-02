@@ -293,8 +293,44 @@ canvas#visualizer { display: block; width: 100%; height: 100%; }
   pointer-events: none;
 }
 .toast.show { opacity: 1; transform: translateY(0); }
+.app-footer {
+  width: min(1440px, 100%);
+  margin: 10px auto 0;
+  padding: 22px clamp(18px, 3vw, 38px) 38px;
+  color: var(--muted);
+  font-size: 13px;
+  letter-spacing: .02em;
+}
+.footer-inner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.footer-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.footer-link {
+  color: var(--muted);
+  text-decoration: none;
+  font-weight: 550;
+  border-bottom: 1px dashed transparent;
+  transition: color 150ms ease, border-color 150ms ease;
+}
+.footer-link:hover {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.footer-sep {
+  color: var(--border-strong, var(--border));
+  user-select: none;
+  opacity: .7;
+}
 body.obs-mode { background: transparent !important; }
-body.obs-mode .app-header, body.obs-mode .control-card, body.obs-mode .side-column { display: none !important; }
+body.obs-mode .app-header, body.obs-mode .control-card, body.obs-mode .side-column, body.obs-mode .app-footer { display: none !important; }
 body.obs-mode .workspace { width: 100%; height: 100vh; padding: 0; }
 body.obs-mode .workspace-grid { height: 100%; display: block; }
 body.obs-mode .main-column { height: 100%; justify-content: flex-end; }

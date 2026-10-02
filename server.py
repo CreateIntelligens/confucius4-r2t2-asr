@@ -25,6 +25,7 @@ if CONFUCIUS_DIR not in sys.path:
     sys.path.insert(0, CONFUCIUS_DIR)
 
 from sanic import Sanic, Request, Websocket, response
+from sanic.exceptions import MethodNotAllowed
 from sanic.worker.manager import WorkerManager
 from sanic.worker.process import WorkerProcess
 from opencc import OpenCC
@@ -214,6 +215,42 @@ def resolve_qwen_context(header, smooth):
         context_parts.append(system_prompt)
     return "\n".join(context_parts)
 
+_LANG_MAP = {
+    "auto": None,
+    "none": None,
+    # 「zhen」（中英混講）對應成 Chinese，不是自動判斷：自動判斷只憑開頭 0.3 秒就鎖定語言，
+    # 帶口音的華語曾被整句轉成葡萄牙文；指定 Chinese 時夾雜的英文仍會照實輸出。
+    # 要自動判斷請送 auto。串流 header 沒帶 language 時視為 zhen。
+    "zhen": "Chinese",
+    "zh-cn": "Chinese",
+    "zh-tw": "Chinese",
+    "": None,
+    "zh": "Chinese",
+    "chinese": "Chinese",
+    "en": "English",
+    "english": "English",
+    "yue": "Cantonese",
+    "cantonese": "Cantonese",
+    "ja": "Japanese",
+    "japanese": "Japanese",
+    "ko": "Korean",
+    "korean": "Korean",
+    "fr": "French",
+    "french": "French",
+    "de": "German",
+    "german": "German",
+    "es": "Spanish",
+    "spanish": "Spanish",
+}
+
+def normalize_asr_language(lang: Optional[str]) -> Optional[str]:
+    if not lang:
+        return None
+    val = str(lang).strip().lower()
+    if val in _LANG_MAP:
+        return _LANG_MAP[val]
+    return str(lang).strip().capitalize()
+
 asr_model = None
 stream_vad = None
 
@@ -299,22 +336,6 @@ def new_stream_vad():
         cfg,
     )
 
-
-def resolve_stream_language(header):
-    """Map the header's language to what the model takes (None = auto-detect).
-
-    「zhen」（中英混講）對應成 Chinese：交給自動判斷時，模型只憑開頭 0.3 秒
-    就鎖定語言，帶口音的華語曾被整句轉成葡萄牙文。要自動判斷請明確送 auto。
-    """
-    language = str(header.get("language") or "zhen").strip()
-    low = language.lower()
-    if low == "auto":
-        return None
-    if low in ("zhen", "zh", "zh-cn", "zh-tw", "chinese"):
-        return "Chinese"
-    if low in ("en", "english"):
-        return "English"
-    return language
 
 @app.listener('before_server_start')
 async def initialize_models(app):
@@ -416,6 +437,53 @@ secret_key_list = ["test0102"]
 WEB_DIR = os.path.join(CURRENT_DIR, "web")
 app.static("/assets", os.path.join(WEB_DIR, "assets"), name="web_assets")
 
+# CORS Middleware & Preflight Handlers
+@app.middleware("response")
+async def add_cors_headers(request: Request, response_obj):
+    if response_obj:
+        response_obj.headers["Access-Control-Allow-Origin"] = "*"
+        response_obj.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
+        response_obj.headers["Access-Control-Allow-Headers"] = "*"
+        response_obj.headers["Access-Control-Max-Age"] = "86400"
+
+@app.exception(MethodNotAllowed)
+async def handle_method_not_allowed(request: Request, exception: MethodNotAllowed):
+    if request.method == "OPTIONS":
+        return response.empty(
+            status=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+    return response.text("Method Not Allowed", status=405)
+
+@app.options("/<path:path>")
+async def handle_options_all(request: Request, path: str = ""):
+    return response.empty(
+        status=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
+
+@app.options("/")
+async def handle_options_root(request: Request):
+    return response.empty(
+        status=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
+
 @app.route("/")
 async def handle_index(request: Request):
     index_path = os.path.join(WEB_DIR, "index.html")
@@ -423,8 +491,19 @@ async def handle_index(request: Request):
         return await response.file(index_path)
     return response.text("Confucius4-R2T2 service running. Web UI not found.", status=404)
 
-@app.route("/health")
+@app.route("/llms.txt")
+async def handle_llms_txt(request: Request):
+    llms_path = os.path.join(WEB_DIR, "llms.txt")
+    if not os.path.exists(llms_path):
+        llms_path = os.path.join(CURRENT_DIR, "llms.txt")
+    if os.path.exists(llms_path):
+        return await response.file(llms_path, mime_type="text/plain; charset=utf-8")
+    return response.text("llms.txt not found", status=404)
+
+@app.route("/health", methods=["GET", "OPTIONS"])
 async def handle_health(request: Request):
+    if request.method == "OPTIONS":
+        return response.empty(status=204)
     inference = infer_gate.snapshot()
     stalled = inference["busy_seconds"] > STALL_SECONDS
     return response.json({
@@ -487,12 +566,15 @@ async def transcribe_audio_segment(
     await run_infer(asr_model.finish_streaming_transcribe, state, max_tokens)
     return _convert_output_text(state.text.split("|")[0].strip(), output_script)
 
-@app.route("/transcribe", methods=["POST"])
+@app.route("/transcribe", methods=["POST", "OPTIONS"])
 async def handle_transcribe(request: Request):
     """
     HTTP REST 一次性音訊轉寫端點 (支援 WAV, MP3, FLAC, M4A, OGG 等)
     供外部 App、腳本、自動化流程直接上傳音訊檔案獲取辨識結果。
     """
+    if request.method == "OPTIONS":
+        return response.empty(status=204)
+
     if asr_model is None:
         return response.json({"status": "error", "message": "Model not loaded"}, status=503)
 
@@ -511,7 +593,7 @@ async def handle_transcribe(request: Request):
         duration_sec = round(len(wav) / 16000.0, 2)
 
         t0 = time.time()
-        lang_param = resolve_stream_language({"language": language or "auto"})
+        lang_param = normalize_asr_language(language)
         segment_texts = []
         for start in range(0, len(wav), TRANSCRIBE_SEGMENT_SAMPLES):
             segment = wav[start : start + TRANSCRIBE_SEGMENT_SAMPLES]
@@ -532,8 +614,11 @@ async def handle_transcribe(request: Request):
         return response.json({"status": "error", "message": str(e)}, status=500)
 
 
-@app.route("/transcribe/cancel", methods=["POST"])
+@app.route("/transcribe/cancel", methods=["POST", "OPTIONS"])
 async def handle_transcribe_cancel(request: Request):
+    if request.method == "OPTIONS":
+        return response.empty(status=204)
+
     payload = request.json or {}
     job_id = payload.get("job_id")
     if not isinstance(job_id, str) or not job_id:
@@ -548,8 +633,11 @@ async def handle_transcribe_cancel(request: Request):
     return response.json({"status": "cancelling", "job_id": job_id})
 
 
-@app.route("/transcribe/stream", methods=["POST"])
+@app.route("/transcribe/stream", methods=["POST", "OPTIONS"])
 async def handle_transcribe_stream(request: Request):
+    if request.method == "OPTIONS":
+        return response.empty(status=204)
+
     if asr_model is None:
         return response.json({"status": "error", "message": "Model not loaded"}, status=503)
 
@@ -568,13 +656,17 @@ async def handle_transcribe_stream(request: Request):
         logger.exception(f"Audio decode error: {e}")
         return response.json({"status": "error", "message": "無法讀取音訊檔案，請確認檔案格式後重試。"}, status=400)
 
-    lang_param = resolve_stream_language({"language": language or "auto"})
+    lang_param = normalize_asr_language(language)
 
     duration_sec = len(wav) / 16000.0
     total_segments = max(1, (len(wav) + TRANSCRIBE_SEGMENT_SAMPLES - 1) // TRANSCRIBE_SEGMENT_SAMPLES)
     stream = await request.respond(
         content_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
     )
 
     def send_event(payload: dict) -> str:
@@ -713,7 +805,7 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
 
             requestId = header.get("requestId", None)
             use_vad = header.get("use_vad", True)
-            language = resolve_stream_language(header)
+            language = normalize_asr_language(header.get("language") or "zhen")
             output_script = header.get("output_script", "simplified")
             if output_script not in ("traditional", "simplified"):
                 output_script = "simplified"

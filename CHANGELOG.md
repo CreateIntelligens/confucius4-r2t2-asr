@@ -1,28 +1,11 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Versions are categorized by date (`YYYY-MM-DD`).
 
 ---
 
-## [Unreleased]
-
-### Added
-- **GHCR 自動部署**：新增 GitHub Actions 工作流程，將 `main` 建置為 GHCR 版本映像，並由正式主機 runner 部署與執行健康檢查；失敗時還原原服務檔案。
-- **一般／深色模式與字幕工作台改版**：新增主題切換，OBS 空白狀態不再顯示無法操作的提示。
-- **長音檔逐段字幕**：新增 `POST /transcribe/stream`，每 30 秒建立獨立辨識狀態，逐段回傳字幕、音訊時間與進度。
-- **繁體中文輸出**：新增繁體／簡體選擇；繁體字幕使用 OpenCC 轉換辨識結果，即時串流與音檔轉寫皆適用。
-- **停止音檔辨識**：新增工作 ID 與取消端點，可停止目前解碼步驟後的後續分段，並保留已完成字幕。
-- **前端資產拆分**：將樣式與互動程式移至 `web/assets/app.css` 與 `web/assets/app.js`，由 Sanic `/assets` 路由提供。
-
-### Changed
-- **長音檔上下文管理**：`POST /transcribe` 與串流上傳流程改為每 30 秒重設辨識狀態，避免整段音檔累積超過模型 token 上限。
-- **音檔容量與等待時間**：網頁單檔上限提高至 200 MB；Nginx 與 Sanic 設定同步支援大型上傳及長時間辨識。
-- **產品標題**：網頁頁籤與頁首改為 `333-R2T2-ASR`。
-
-## [1.3.0] - 2026-10-01
+## [dev 分支，尚未併入 main]
 
 ### Added
 - **Transformers 後端也能串流**：`app/r2t2/r2t2_asr.py` 的串流解碼不再限定 vLLM，aarch64 / 顯存吃緊的主機（如 NVIDIA GB10）可直接串流。
@@ -65,29 +48,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 已實測的組合：GB10（aarch64）的 Docker 映像（llama.cpp、Transformers）；RTX A4000（x86_64）的 Docker 映像（llama.cpp、Transformers）以及直接執行的 `server.py` 與 `app/main.py` 搭 vLLM 0.14。正式的 vLLM 主機（RTX 4000 Ada）尚未部署這一版。
 - vLLM 0.14 在 GB10 上無法啟動（CUDA 12 版本，且編譯工具不支援該晶片）；在 A4000 上需要 `gpu_memory_utilization` 約 0.50（約 6.2 GB），實測沒有比 Transformers 快。
 - `server.py` 沒有 `final_text`。
-## [1.2.0] - 2026-09-30
-
-### Added
-- **HTTP REST 音訊轉寫端點 (`POST /transcribe`)**：
-  - 於 `server.py` 實作音訊檔案上傳介面，支援 WAV, MP3, FLAC, M4A, OGG 等多種格式，外部 App 可直接發起單次 HTTP 請求獲取轉寫文字。
-- **外部應用程式即時串流示範腳本 (`examples/client_stream_demo.py`)**：
-  - 提供開箱即用的 Python 客戶端範例，示範建立 WebSocket 連線、發送握手 JSON、串流 PCM 音訊切片（160ms chunks）及接收即時增量字幕。
-- **外部 App 調用 API 指南**：
-  - 於 `README.md` 詳細補充 HTTP REST 與 WebSocket 的通訊協定規範、cURL、Python 及 Node.js 呼叫代碼範例。
-- **端點與運行狀態資訊**：
-  - 於 `README.md` 標註外部存取網址（`https://147.5gao.ai/`）、即時字幕網頁介面特色與 GPU 顯存隔離（40% VRAM 與 TTS 服務共存）狀態。
 
 ---
 
-## [1.1.0] - 2026-09-30
+## [2026-10-02]
 
 ### Added
+- **專業英文規格文件 (`llms.txt`)**：
+  - 依據 [llmstxt.org](https://llmstxt.org) 規範重寫專案根目錄 `llms.txt` 與前端 `web/llms.txt`。
+  - 詳細記錄架構設計、HTTP REST (`/transcribe`)、長音檔 SSE 分段串流 (`/transcribe/stream`)、任務取消 (`/transcribe/cancel`)、低延遲 WebSocket (`/asr_stream_api_v1`) 通訊協定規範。
+  - 詳列二進位音訊規範（16kHz, 16-bit signed integer, Mono, 160ms/5120 bytes chunk）以及 cURL、Python (requests/websockets)、JavaScript/TypeScript (Fetch/SSE) 整合範例。
+- **全新獨立網域名稱與 SSL (`asr.5gao.ai`)**：
+  - 在伺服器 Nginx 配置全新獨立站點 `asr.5gao.ai`，取得並配置 Let's Encrypt 自動續期 SSL 憑證。
+  - 保留原有 `147.5gao.ai` 雙網域並行運作，對外提供穩定的 HTTPS 與 WSS 雙通道。
+- **CI/CD 自動化部屬管線 (GitHub Actions & Self-hosted Runner)**：
+  - 於主機 `10.9.0.35` 註冊系統級守護進程 `actions.runner.CreateIntelligens-confucius4-r2t2-asr.virtualhumantest-r2t2.service`。
+  - 建立 `.github/workflows/deploy-ghcr.yml` 與 `Dockerfile.ghcr`，提交至 `main` 分支時自動建置映像發布至 GHCR，並由主機自動拉取部署、平滑重啟 `confucius4-r2t2.service` 與執行 `/health` 健康檢查，異常時具備自動回滾能力。
+- **品牌識別與 Open Graph 社交卡片**：
+  - 於網頁底部加入「技術提供 david888.com | llms.txt」精緻連結（OBS 直播模式下自動隱藏）。
+  - 設計並產出標準 1200×630 尺寸 Open Graph 社群分享圖 (`web/assets/og-image.png`，524KB) 與社交 Meta 標籤。
+
+### Fixed
+- **全端點 CORS 與 OPTIONS Preflight 跨域支援**：
+  - 實作 Sanic `MethodNotAllowed` (405) 例外攔截器，當收到任意路徑之 `OPTIONS` 預檢請求時，統一回傳 `HTTP 204 No Content` 並附加完整 CORS 標頭 (`Access-Control-Allow-Origin: *`、`Access-Control-Allow-Methods: GET, POST, OPTIONS, PUT, DELETE`)。
+  - 針對 `/transcribe`、`/transcribe/stream`、`/transcribe/cancel`、`/health` 端點明確支援 `OPTIONS` 方法，徹底解決 Vue/React 等第三方瀏覽器應用程式發起跨網域請求時被瀏覽器攔截的 CORS 阻擋問題。
+- **語音模型語系代碼正規化 (Language Normalization)**：
+  - 實作 `normalize_asr_language()` 模組，將前端與 API 傳入之 `auto`、`zh`、`en`、`zhen` 等代碼自動正規化為 Qwen-ASR 底層相容名稱，防止模型拋出 `ValueError: Unsupported language` 崩潰。
+
+### Changed
+- **前端工作台視覺淨化**：
+  - 移除標頭中冗贅之文字（「語音工作台 / 語音工作區...」），提升整體版面質感與工藝標準（Craft Floor）。
+
+## [2026-10-01]
+
+### Added
+- **長音檔逐段字幕串流 (`POST /transcribe/stream`)**：
+  - 每 30 秒建立獨立辨識狀態，透過 Server-Sent Events (SSE) 逐段回傳字幕文字、音訊時間戳與整體進度。
+- **繁體中文輸出選項**：
+  - 整合 OpenCC 繁體中文轉換庫，支援簡體與台灣繁體中文切換，即時串流與音檔辨識皆可套用。
+- **轉寫任務取消機制 (`POST /transcribe/cancel`)**：
+  - 提供 `task_id` 取消正在進行之長音檔轉寫分段，已轉寫完成部分保留輸出。
+- **深色模式與多主題切換**：
+  - 支援系統主題同步與深淺切換，OBS 模式下空白狀態優化。
+- **前端模組資產獨立化**：
+  - 將樣式與邏輯拆分至 `web/assets/app.css` 與 `web/assets/app.js`，交由 Sanic `/assets` 靜態路由分發。
+
+### Changed
+- **長音檔上下文記憶體管理**：
+  - 音檔分段解碼改為每 30 秒自動重設 ASR state，避免單一任務 token 累積超過模型上限。
+- **大型上傳支援**：
+  - 單檔音訊上傳上限提升至 200 MB，Nginx 與 Sanic 設定超時時間同步拉長至 1800 秒。
+- **品牌名稱統一**：
+  - 網頁標題與品牌識別統一為 `333-R2T2-ASR`。
+
+---
+
+## [2026-09-30]
+
+### Added
+- **HTTP REST 音訊轉寫端點 (`POST /transcribe`)**：
+  - 於 `server.py` 實作音訊檔案上傳介面，支援 WAV, MP3, FLAC, M4A, OGG 等多種格式。
 - **即時字幕 Single Page Application (SPA)** (`web/index.html`)：
-  - 原生 Web Audio API 即時收音與高品質線性降採樣（任何瀏覽器取樣率轉為 16kHz 16-bit Mono PCM）。
+  - 原生 Web Audio API 即時收音與降採樣（16kHz 16-bit Mono PCM）。
   - HTML5 Canvas 即時聲波振幅（Waveform）視覺化。
   - OBS / vMix 直播透明覆蓋模式（去背、無背景、高對比字卡）。
-  - 歷史字幕卡片滾動歸檔，支援一鍵複製與 TXT / JSON 導出。
-  - 完整 SSL / WSS 雙向連線狀態與延遲指示燈。
+  - 歷史字幕滾動歸檔，支援一鍵複製與 TXT / JSON 導出。
 - **反幻覺與熔斷機制 (`server.py`)**：
   - 實作 N-gram 重複詞元偵測演算法 (`detect_hallucination`)，當自迴歸模型陷入死循環時主動中斷並重置 ASR State。
   - 整合 `FireRedStreamVad` 語音活動檢測，將停頓靜音閥值調優為 `min_silence_frame=60`（約 700ms），自動標記 `speech_end` 並換句。
@@ -109,13 +134,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **QEMU CPU 無 AVX 指令集導致 SIGILL 崩潰問題**：
   - 移除不相容之 `nagisa` 與 `dynet38` C++ 擴充依賴，確保在虛擬化與各類雲端環境下執行 Qwen-ASR 模型不觸發非法指令（Illegal Instruction）。
-
----
-
-## [1.0.0] - 2026-09-30
-
-### Added
-- 初始化專案結構，封裝 Confucius4-R2T2（基於 Qwen3-ASR-1.7B）流式推論服務。
-- 提供 FastAPI 服務入口 (`app/main.py`) 與 WebSocket 串流接口 (`/ws/stream`, `/asr_stream_api_v1`)。
-- 提供 Dockerfile 與 Docker Compose 雙容器環境（FastAPI + Nginx）。
-- 提供自動下載權重與啟動預熱（Warmup）腳本。

@@ -1,0 +1,288 @@
+# Confucius4-R2T2 ASR Service (333-R2T2-ASR)
+
+> Production-grade, low-latency Streaming Automatic Speech Recognition (ASR) service powered by NetEase Youdao Confucius4-R2T2 (Qwen3-ASR-1.7B) and FireRedVAD.
+> Built on Longest Stable Prefix (LSP) decoding for append-only, non-flickering, hallucination-resistant real-time transcription.
+> Powered by [david888.com](https://david888.com).
+> Public Base URL: `https://asr.5gao.ai` (Alternative: `https://147.5gao.ai`)
+> WebSocket Endpoint: `wss://asr.5gao.ai/asr_stream_api_v1`
+
+---
+
+## Service Overview
+
+Confucius4-R2T2 is a streaming speech foundation model tailored for real-time applications such as live broadcast captioning, interactive voice assistants, video conferencing, and automated transcription workflows.
+
+### Key Capabilities
+- **Longest Stable Prefix (LSP) Decoding**: Strictly append-only output; characters do not flicker, mutate, or regress once emitted.
+- **Sub-200ms Latency**: Stream processing delivers incremental subtitles within ~100–180ms per chunk.
+- **Integrated FireRedVAD**: Real-time voice activity detection handles pauses and natural sentence segmentation automatically.
+- **Multilingual Support**: Chinese (Traditional / Simplified), English, Cantonese, Japanese, Korean, French, German, Spanish, and Automatic Language Identification.
+- **CORS Enabled**: All endpoints allow cross-origin requests (`Access-Control-Allow-Origin: *`) with preflight `OPTIONS` support for browser applications.
+
+---
+
+## API Endpoints
+
+### 1. Health & Status Check
+
+Verify server availability and GPU model readiness.
+
+- **Endpoint**: `GET /health`
+- **Headers**: None required
+
+#### Response
+```json
+{
+  "status": "healthy",
+  "service": "Confucius4-R2T2",
+  "active_connections": 0,
+  "gpu_mem_util": "0.40",
+  "model_loaded": true
+}
+```
+
+---
+
+### 2. Audio File Transcription (HTTP REST)
+
+Upload an audio file for one-shot transcription. Files up to 200MB are supported. Supported audio formats include WAV, MP3, FLAC, M4A, AAC, and OGG.
+
+- **Endpoint**: `POST /transcribe`
+- **Content-Type**: `multipart/form-data`
+
+#### Parameters
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `file` | Binary | Yes | — | Audio file binary payload. |
+| `language` | string | No | `auto` | Target speech language: `auto`, `zh`, `en`, `yue`, `ja`, `ko`, `fr`, `de`, `es`. |
+| `context` | string | No | `""` | Contextual bias, terminology, prompt, or hotwords. |
+| `output_script` | string | No | `traditional` | Output Chinese character script: `traditional` (繁體中文) or `simplified` (簡體中文). |
+
+#### Response
+```json
+{
+  "status": "success",
+  "text": "歡迎使用實時語音辨識服務。",
+  "duration_sec": 5.42,
+  "cost_ms": 182.4
+}
+```
+
+#### cURL Example
+```bash
+curl -X POST https://asr.5gao.ai/transcribe \
+  -F "file=@meeting.mp3" \
+  -F "language=auto" \
+  -F "output_script=traditional" \
+  -F "context=Confucius4 R2T2 ASR"
+```
+
+#### Python Example
+```python
+import requests
+
+url = "https://asr.5gao.ai/transcribe"
+with open("meeting.mp3", "rb") as f:
+    files = {"file": f}
+    data = {
+        "language": "auto",
+        "output_script": "traditional",
+        "context": "Confucius4 R2T2"
+    }
+    response = requests.post(url, files=files, data=data, timeout=300)
+
+result = response.json()
+print("Transcription:", result.get("text"))
+print(f"Duration: {result.get('duration_sec')}s | Latency: {result.get('cost_ms')}ms")
+```
+
+---
+
+### 3. Long Audio Segmented Streaming (Server-Sent Events)
+
+For longer recordings (podcasts, lectures, interviews), stream transcription progress segment by segment (30s chunks) via SSE without waiting for the full file to process.
+
+- **Endpoint**: `POST /transcribe/stream`
+- **Content-Type**: `multipart/form-data`
+- **Accept**: `text/event-stream`
+
+#### SSE Events
+- `init`: Emitted when the job begins, containing the generated `task_id`.
+- `segment`: Emitted as each 30s chunk completes, including `text`, `start_time`, and `end_time`.
+- `done`: Emitted upon job completion with the aggregated full transcript.
+- `error`: Emitted if an error occurs.
+
+#### JavaScript / Web Browser Example
+```javascript
+const formData = new FormData();
+formData.append("file", audioBlob, "lecture.mp3");
+formData.append("language", "auto");
+formData.append("output_script", "traditional");
+
+const response = await fetch("https://asr.5gao.ai/transcribe/stream", {
+  method: "POST",
+  body: formData
+});
+
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  const chunk = decoder.decode(value);
+  console.log("SSE Event Chunk:", chunk);
+}
+```
+
+---
+
+### 4. Cancel Ongoing Transcription
+
+Cancel an active segmented transcription task by its `job_id`.
+
+- **Endpoint**: `POST /transcribe/cancel`
+- **Content-Type**: `application/json`
+
+#### Request Body
+```json
+{
+  "job_id": "c1f7b0a8-4389-4d2a-9f5b-1e9d8e7c6b5a"
+}
+```
+
+#### Response
+```json
+{
+  "status": "cancelling",
+  "job_id": "c1f7b0a8-4389-4d2a-9f5b-1e9d8e7c6b5a"
+}
+```
+
+---
+
+### 5. Real-Time Streaming WebSocket API (Low Latency)
+
+Designed for live microphone capture, OBS broadcast overlays, voicebots, and real-time captioning.
+
+- **Endpoint**: `wss://asr.5gao.ai/asr_stream_api_v1`
+- **Audio Specification**:
+  - Format: Raw PCM (signed 16-bit little-endian integer, `s16le`)
+  - Sample Rate: `16000` Hz (16 kHz)
+  - Channels: `1` (Mono)
+  - Chunk Size: `5120` bytes per chunk (160ms of audio, 2560 samples)
+
+#### Protocol Lifecycle
+
+1. **Client Handshake (JSON text frame)**:
+   Immediately upon opening the WebSocket connection, client sends the configuration header:
+   ```json
+   {
+     "api_key": "test0102",
+     "sample_rate": 16000,
+     "language": "auto",
+     "system_prompt": "Terminology or hotwords",
+     "output_script": "traditional",
+     "smooth": false,
+     "vad": true
+   }
+   ```
+
+2. **Continuous Audio Streaming (Binary frames)**:
+   Client repeatedly pushes 5120-byte PCM chunks at real-time pace (~160ms interval).
+
+3. **Incremental Subtitle Broadcast (Server JSON text frames)**:
+   Server streams back delta recognition updates:
+   ```json
+   {
+     "status": "success",
+     "requestId": "550e8400-e29b-41d4-a716-446655440000",
+     "msg": {
+       "text": "即時辨識增量文字",
+       "reset": false,
+       "asr_cost_ms": 16.4,
+       "total_cost_ms": 21.0
+     }
+   }
+   ```
+   *Note: When `reset: true`, a sentence boundary has been reached (via VAD). Future `text` increments belong to the subsequent utterance.*
+
+4. **Termination**:
+   Client closes the WebSocket connection or sends the end-of-stream signal:
+   `YOUDAO_ONETIME_ASR_STREAM_EOS`
+
+#### Python Real-time Streaming Example
+```python
+import asyncio
+import json
+import websockets
+
+URI = "wss://asr.5gao.ai/asr_stream_api_v1"
+
+async def stream_audio_file(pcm_file_path: str):
+    async with websockets.connect(URI) as ws:
+        # Step 1: Send handshake configuration
+        handshake = {
+            "api_key": "test0102",
+            "sample_rate": 16000,
+            "language": "auto",
+            "output_script": "traditional",
+            "system_prompt": "david888 Confucius4 R2T2"
+        }
+        await ws.send(json.dumps(handshake))
+
+        # Step 2: Background listener for real-time transcription
+        async def listen_subtitles():
+            try:
+                async for message in ws:
+                    data = json.loads(message)
+                    if data.get("status") == "success":
+                        msg = data.get("msg", {})
+                        text = msg.get("text", "")
+                        if text:
+                            print(text, end="", flush=True)
+                        if msg.get("reset"):
+                            print("\n", end="", flush=True)
+            except websockets.exceptions.ConnectionClosed:
+                pass
+
+        listener = asyncio.create_task(listen_subtitles())
+
+        # Step 3: Stream 160ms chunks (5120 bytes) of 16kHz 16-bit PCM
+        with open(pcm_file_path, "rb") as f:
+            while chunk := f.read(5120):
+                await ws.send(chunk)
+                await asyncio.sleep(0.16)
+
+        # Step 4: Finish stream
+        await ws.send(b"YOUDAO_ONETIME_ASR_STREAM_EOS")
+        await asyncio.sleep(0.5)
+        await ws.close()
+        await listener
+
+if __name__ == "__main__":
+    asyncio.run(stream_audio_file("speech_16k.pcm"))
+```
+
+---
+
+## Technical Specifications
+
+| Parameter | Specification |
+|---|---|
+| **Base Architecture** | Qwen3-ASR (1.7B) + LSP Decoder + FireRedVAD Stream |
+| **Inference Engine** | vLLM EngineCore (CUDA Accelerated) |
+| **Max Payload Size** | 200 MB per HTTP request |
+| **Target Sample Rate** | 16,000 Hz |
+| **Bit Depth** | 16-bit Signed Integer (Little-Endian) |
+| **Channels** | Single Channel (Mono) |
+| **Average Stream Latency** | ~110 ms – 180 ms |
+| **Cross-Origin Resource Sharing (CORS)** | Enabled globally (`*`) for all origins |
+
+---
+
+## Contact & Support
+
+- **Provider**: [david888.com](https://david888.com)
+- **Web Portal**: [https://asr.5gao.ai/](https://asr.5gao.ai/)
+- **Documentation**: [https://asr.5gao.ai/llms.txt](https://asr.5gao.ai/llms.txt)
