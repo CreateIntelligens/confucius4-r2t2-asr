@@ -20,6 +20,7 @@ Versions are categorized by date (`YYYY-MM-DD`).
 - **`app/main.py` 支援繁體輸出與停止上傳辨識**：`output_script`（串流 header 與兩個上傳端點）、`POST /transcribe/cancel` 與 `start` 事件的 `job_id`，與 `server.py` 相同。串流的繁體轉換以整句累積文字進行，被拆在兩則訊息裡的詞仍會轉成台灣慣用語；`final_text` 以整句轉換。
 
 ### Changed
+- **`.env` 移出版控**，改提供 `.env.example`（列出 `compose.yaml` 會讀的全部變數，含對外埠 `PUBLIC_PORT`）。每台機器自己的路徑與埠留在本機的 `.env`。
 - **所有模型呼叫共用一個排隊鎖並在執行緒中執行**（`app/main.py` 與 `server.py`）：多路串流與批次請求輪流推論，不再阻塞事件迴圈。
 - **每條連線獨立的 VAD 狀態**：只共用模型權重。有 VAD 時偵測到語音才開始解碼，靜音不佔 GPU。
 - **推論落後時自動併塊**：一步最多處理 1.28 秒音訊；滑動視窗改以實際樣本數裁切，分塊大小可變。

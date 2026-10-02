@@ -119,3 +119,11 @@ def test_both_servers_serve_llms_txt():
     assert '@app.get("/llms.txt")' in read("app/main.py")
     assert 'href="/llms.txt"' in read("web/index.html")
     assert read("llms.txt") == read("web/llms.txt")
+
+
+def test_env_example_documents_every_compose_variable():
+    """.env is machine-local and untracked; .env.example is what a new machine starts from."""
+    used = set(re.findall(r"\$\{([A-Z_]+)", read("compose.yaml")))
+    documented = set(re.findall(r"^([A-Z_]+)=", read(".env.example"), flags=re.M))
+    assert used == documented, (sorted(used - documented), sorted(documented - used))
+    assert ".env" in read(".gitignore").split()

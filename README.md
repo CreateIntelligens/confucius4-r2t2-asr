@@ -115,7 +115,10 @@ docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp -v $PWD:/p python:3.10-sli
   pip download -r /p/requirements.txt setuptools wheel -d /p/wheels \
     --extra-index-url https://download.pytorch.org/whl/cu130
 
-# 2. build 與啟動分開做；build 很吃磁碟 I/O，一次只跑一個
+# 2. 建立這台機器的設定（對外埠、模型目錄等；.env 不進版控）
+cp .env.example .env
+
+# 3. build 與啟動分開做；build 很吃磁碟 I/O，一次只跑一個
 docker compose build r2t2-api
 docker compose up -d
 
@@ -129,7 +132,7 @@ docker compose logs -f r2t2-api
 - GPU 以 CDI 模式掛載（`/var/run/cdi/nvidia.yaml`）。主機若只有 legacy nvidia runtime，把 `compose.yaml` 的 `driver: cdi` 與 `device_ids` 改成 `driver: nvidia`、`count: all`。
 - 容器以宿主帳號執行（`HOST_UID`／`HOST_GID`，預設 1000）。
 
-- 容器將對外服務於 `:8803`（可於 `.env` 中調整 `PUBLIC_PORT`）。
+- 容器將對外服務於 `:8803`（可於 `.env` 中調整 `PUBLIC_PORT`）。`.env` 的所有可用變數與預設值見 `.env.example`。
 - 打開瀏覽器訪問 `http://<主機IP>:8803/` 即可進入**即時字幕操作介面**。
 
 ---
