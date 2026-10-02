@@ -25,6 +25,7 @@ if CONFUCIUS_DIR not in sys.path:
     sys.path.insert(0, CONFUCIUS_DIR)
 
 from sanic import Sanic, Request, Websocket, response
+from sanic.exceptions import MethodNotAllowed
 from sanic.worker.manager import WorkerManager
 from sanic.worker.process import WorkerProcess
 from opencc import OpenCC
@@ -357,9 +358,24 @@ async def add_cors_headers(request: Request, response_obj):
         response_obj.headers["Access-Control-Allow-Headers"] = "*"
         response_obj.headers["Access-Control-Max-Age"] = "86400"
 
+@app.exception(MethodNotAllowed)
+async def handle_method_not_allowed(request: Request, exception: MethodNotAllowed):
+    if request.method == "OPTIONS":
+        return response.empty(
+            status=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+    return response.text("Method Not Allowed", status=405)
+
 @app.options("/<path:path>")
 async def handle_options_all(request: Request, path: str = ""):
     return response.empty(
+        status=204,
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
@@ -371,6 +387,7 @@ async def handle_options_all(request: Request, path: str = ""):
 @app.options("/")
 async def handle_options_root(request: Request):
     return response.empty(
+        status=204,
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, DELETE",
@@ -395,8 +412,10 @@ async def handle_llms_txt(request: Request):
         return await response.file(llms_path, mime_type="text/plain; charset=utf-8")
     return response.text("llms.txt not found", status=404)
 
-@app.route("/health")
+@app.route("/health", methods=["GET", "OPTIONS"])
 async def handle_health(request: Request):
+    if request.method == "OPTIONS":
+        return response.empty(status=204)
     return response.json({
         "status": "healthy",
         "service": "Confucius4-R2T2",
@@ -450,12 +469,15 @@ def _transcribe_audio_segment(
     asr_model.finish_streaming_transcribe(state, max_tokens)
     return _convert_output_text(state.text.split("|")[0].strip(), output_script)
 
-@app.route("/transcribe", methods=["POST"])
+@app.route("/transcribe", methods=["POST", "OPTIONS"])
 async def handle_transcribe(request: Request):
     """
     HTTP REST 一次性音訊轉寫端點 (支援 WAV, MP3, FLAC, M4A, OGG 等)
     供外部 App、腳本、自動化流程直接上傳音訊檔案獲取辨識結果。
     """
+    if request.method == "OPTIONS":
+        return response.empty(status=204)
+
     if asr_model is None:
         return response.json({"status": "error", "message": "Model not loaded"}, status=503)
 
@@ -498,8 +520,11 @@ async def handle_transcribe(request: Request):
         return response.json({"status": "error", "message": str(e)}, status=500)
 
 
-@app.route("/transcribe/cancel", methods=["POST"])
+@app.route("/transcribe/cancel", methods=["POST", "OPTIONS"])
 async def handle_transcribe_cancel(request: Request):
+    if request.method == "OPTIONS":
+        return response.empty(status=204)
+
     payload = request.json or {}
     job_id = payload.get("job_id")
     if not isinstance(job_id, str) or not job_id:
@@ -514,8 +539,11 @@ async def handle_transcribe_cancel(request: Request):
     return response.json({"status": "cancelling", "job_id": job_id})
 
 
-@app.route("/transcribe/stream", methods=["POST"])
+@app.route("/transcribe/stream", methods=["POST", "OPTIONS"])
 async def handle_transcribe_stream(request: Request):
+    if request.method == "OPTIONS":
+        return response.empty(status=204)
+
     if asr_model is None:
         return response.json({"status": "error", "message": "Model not loaded"}, status=503)
 
