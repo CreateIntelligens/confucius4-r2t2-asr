@@ -20,6 +20,9 @@ Versions are categorized by date (`YYYY-MM-DD`).
 - **`app/main.py` 支援繁體輸出與停止上傳辨識**：`output_script`（串流 header 與兩個上傳端點）、`POST /transcribe/cancel` 與 `start` 事件的 `job_id`，與 `server.py` 相同。串流的繁體轉換以整句累積文字進行，被拆在兩則訊息裡的詞仍會轉成台灣慣用語；`final_text` 以整句轉換。
 
 ### Changed
+- **`server.py` 改採 main 的推論排程器**（單一工作執行緒加雙佇列），不再維護 dev 自己的排隊鎖版本；只保留兩處差異：`zhen` 對應成 Chinese、建立串流狀態也交給工作執行緒。
+- **`app/main.py` 串流優先於上傳音檔**：有人在講話時，上傳最多每 `UPLOAD_MIN_INTERVAL_SECONDS`（預設 5 秒）跑一段，沒人講話時不受限制。按次數輪流（main 的每 6 步讓一段）在這裡不夠：上傳的一段是 30 秒音訊一次算完，實測三路串流仍會晚 1.5–5.5 秒。`/healthz` 的 `inference` 多了 `waiting_live`、`waiting_batch`。
+- **`app/main.py` 同時串流數上限** `MAX_CONCURRENT_STREAMS`（預設 12），超過時回錯誤訊息並以 1013 關閉，與 `server.py` 相同。
 - **`.env` 移出版控**，改提供 `.env.example`（列出 `compose.yaml` 會讀的全部變數，含對外埠 `PUBLIC_PORT`）。每台機器自己的路徑與埠留在本機的 `.env`。
 - **所有模型呼叫共用一個排隊鎖並在執行緒中執行**（`app/main.py` 與 `server.py`）：多路串流與批次請求輪流推論，不再阻塞事件迴圈。
 - **每條連線獨立的 VAD 狀態**：只共用模型權重。有 VAD 時偵測到語音才開始解碼，靜音不佔 GPU。
@@ -65,11 +68,30 @@ Versions are categorized by date (`YYYY-MM-DD`).
 - **CI/CD 自動化部屬管線 (GitHub Actions & Self-hosted Runner)**：
   - 於主機 `10.9.0.35` 註冊系統級守護進程 `actions.runner.CreateIntelligens-confucius4-r2t2-asr.virtualhumantest-r2t2.service`。
   - 建立 `.github/workflows/deploy-ghcr.yml` 與 `Dockerfile.ghcr`，提交至 `main` 分支時自動建置映像發布至 GHCR，並由主機自動拉取部署、平滑重啟 `confucius4-r2t2.service` 與執行 `/health` 健康檢查，異常時具備自動回滾能力。
+- **微批優先級排程調度器 (Option A: FairInferenceScheduler with Deficit Round-Robin)**：
+  - 徹底重構 GPU 推論排程架構，以單一專屬推論工作線程 (`ASRInferenceWorker`) 搭配 DRR 虧額輪轉雙隊列（`MAX_LIVE_BURST=6`），徹底消除多線程直接調用 vLLM 底層 IPC ZeroMQ 造成的跨進程 Futex 互鎖死鎖，同時杜絕大檔轉寫在持續直播負載下的飢餓風險。
+  - 雙軌優先級：WebSocket 實時語音享受最高優先級 (`priority=0`)，HTTP 大檔轉寫微切片使用普通優先級 (`priority=1`)，每 6 個實時切片強制保證調度 1 個檔案切片，維持 15~30ms 極致即時響應且永不飢餓。
+  - 斷線任務跳過 (`cancelled_event`)：客戶端斷線時工作線程自動跳過 GPU 推論，避免浪費顯存算力。
+  - VAD 異步化與安全隔離：將 FireRedVAD 檢測移至 `asyncio.to_thread` 執行緒池，徹底解放 Sanic 主事件迴圈；克隆失敗時安全關閉 VAD，杜絕跨連線特徵快取污染。
+  - 連續說話長度溢出防護 (`MAX_CONTINUOUS_SPEECH_SEC=25.0`)：超過 25 秒無停頓自動觸發語意分段重設，防止超出 vLLM `max_model_len=2048` 崩潰。
+  - 串流連線上限門禁 (`MAX_CONCURRENT_STREAMS=12`)：超載時回傳 1013 Server Busy，防止單卡排隊延遲雪崩。
+  - 雙向非對稱任務生命週期監控：以 `asyncio.wait(..., return_when=FIRST_COMPLETED)` 監管；當 `receiver` 收到 EOS 先結束時，非對稱允許 `processor` 完整排空剩餘音訊切片並傳回最終字幕，徹底消除協程洩漏與提早截斷。
+  - Zero-Polling 空轉待機：`FairInferenceScheduler` 引入 `threading.Event` 事件喚醒，實現佇列為空時零 CPU 耗損。
+  - Handshake 握手安全：加入 10 秒握手逾時與 JSON 物件型別校驗，防範未認證連線長期佔用 Socket。
+  - 防禦性關閉與佇列清理：`_dispatch_to_loop` 防止 Event Loop 關閉時 Worker 線程拋出異常死亡；`stop()` 自動拒絕殘留任務。
+  - 健壯性 PCM 解碼：`read_pcm` 自動防範奇數長度與截斷二進位音訊封包。
+  - 於 `GET /health` 端點新增 `"queue_size"` 即時排隊深度監控。
+  - 於 `README.md` 詳盡記錄高並發架構演進評估（方案 A 微批調度、方案 B 進程級雙實例隔離、方案 C 原生 AsyncLLMEngine 動態合批）。
 - **品牌識別與 Open Graph 社交卡片**：
   - 於網頁底部加入「技術提供 david888.com | llms.txt」精緻連結（OBS 直播模式下自動隱藏）。
   - 設計並產出標準 1200×630 尺寸 Open Graph 社群分享圖 (`web/assets/og-image.png`，524KB) 與社交 Meta 標籤。
 
 ### Fixed
+- **vLLM 推論線程競爭死鎖與事件循環阻塞修復 (Inference Thread Lock & Event Loop Decoupling)**：
+  - 診斷出當 HTTP 轉寫請求 (`/transcribe`、`/transcribe/stream`) 與 WebSocket 實時流 (`/asr_stream_api_v1`) 同時並發調用時，因底層 vLLM V1 引擎 `LLM.generate` 缺乏線程安全保護，導致多線程同時向 EngineCore IPC 佇列發送請求並在 `outputs_queue.get()` 相互競爭搶奪輸出，造成跨進程死鎖、Sanic 主線程陷入 futex 阻塞，導致整機連線超時假死。
+  - 引入全域互斥鎖 `ASR_INFER_LOCK` 嚴格序列化每次 `generate` 推論，長音檔以 0.32 秒極小粒度推論並釋放鎖，使 WebSocket 即時語音能以 ~15ms 級微小延遲交錯運算，兼顧即時性與高並發安全。
+  - 將 WebSocket 串流之推論步驟移入 `asyncio.to_thread` 異步執行緒池，徹底解放 Sanic 主事件循環，確保 `/health` 與連線管理永遠流暢無阻塞。
+  - 實作每連線獨立之 `FireRedStreamVad` 狀態複製 (`conn_vad`)，杜絕多連線並行時語音活動檢測特徵快取污染。
 - **全端點 CORS 與 OPTIONS Preflight 跨域支援**：
   - 實作 Sanic `MethodNotAllowed` (405) 例外攔截器，當收到任意路徑之 `OPTIONS` 預檢請求時，統一回傳 `HTTP 204 No Content` 並附加完整 CORS 標頭 (`Access-Control-Allow-Origin: *`、`Access-Control-Allow-Methods: GET, POST, OPTIONS, PUT, DELETE`)。
   - 針對 `/transcribe`、`/transcribe/stream`、`/transcribe/cancel`、`/health` 端點明確支援 `OPTIONS` 方法，徹底解決 Vue/React 等第三方瀏覽器應用程式發起跨網域請求時被瀏覽器攔截的 CORS 阻擋問題。

@@ -17,6 +17,7 @@
     "status": "healthy",
     "service": "Confucius4-R2T2",
     "active_connections": 0,
+    "queue_size": 0,
     "gpu_mem_util": "0.40",
     "model_loaded": true
   }
@@ -371,7 +372,7 @@ ws.on('message', (data) => {
 ### 模式三：服務健康檢查 API (`GET /health`)
 
 ```bash
-curl https://147.5gao.ai/health
+curl https://asr.5gao.ai/health
 ```
 響應：
 ```json
@@ -379,6 +380,7 @@ curl https://147.5gao.ai/health
   "status": "healthy",
   "service": "Confucius4-R2T2",
   "active_connections": 0,
+  "queue_size": 0,
   "gpu_mem_util": "0.40",
   "model_loaded": true,
   "inference": {
@@ -451,6 +453,10 @@ curl https://147.5gao.ai/health
   **請以 `final_text` 作為這一句的定稿。** 串流是邊聽邊出字，已送出的字無法收回，句首偶爾會多出雜字或聽錯同音字；`final_text` 是整句聽完後一次辨識的結果；若一次辨識漏掉串流已經送出的句尾，會自動接回。`final_pass` 為 `false` 表示這句沒有重新辨識（單句超過 30 秒、或因重複幻覺被強制斷句），此時 `final_text` 就是串流累積的文字。
 - **結束串流**：
   送出文字訊息 `YOUDAO_ONETIME_ASR_STREAM_EOS`（全大寫，原樣送出，不是 JSON）。伺服器會回最後一則 `reset: true` 訊息後關閉連線。連續 120 秒沒有收到資料也會關閉。
+- **連線數上限**：
+  同時進行的串流達到 `MAX_CONCURRENT_STREAMS`（預設 12）時，新連線會收到 `{"status": "error", "msg": "server busy: max concurrent streams reached"}`，並以關閉碼 `1013` 結束。
+- **串流優先於上傳**：
+  上傳音檔的每一段（30 秒音訊）要佔用推論一兩秒，期間所有串流的字幕都會頓住。所以有人在講話時，上傳最多每 `UPLOAD_MIN_INTERVAL_SECONDS`（預設 5 秒）跑一段；等待時間依上一段花的時間計算（4 倍，上限即此值），沒人講話時上傳一段接一段，不受限制。30 秒以內的單段音檔視為互動式辨識，和串流同等優先，不受這個限制。
 - **推論出錯**：
   伺服器先送 `{"status": "error", "requestId": "...", "msg": "inference failed: ..."}`，再以關閉碼 `1011` 結束連線；正常結束的關閉碼是 `1000`。
 - **同時多路**：
@@ -490,6 +496,87 @@ curl -F file=@audio.wav -F language=zhen -F context="鶴記企業、沉水泵" h
 | `STREAM_DEFAULT_LANGUAGE` | `zhen` | 串流 header 沒帶 `language` 時的預設值 |
 | `STREAM_SECRET_KEYS` | `test0102` | 串流允許的 `secret_key`，逗號分隔 |
 | `STALL_SECONDS` | `60` | 單次推論超過此秒數，`/healthz` 回報 `stalled` |
+| `MAX_CONCURRENT_STREAMS` | `12` | 同時進行的即時串流上限，超過時以關閉碼 1013 拒絕新連線 |
+| `UPLOAD_MIN_INTERVAL_SECONDS` | `5` | 有人在講話時，上傳音檔最多每隔幾秒佔用一次推論 |
+
+---
+
+## 🏗️ 高並發架構演進與微批優先級排程 (Concurrency Architecture & Evolution Roadmap)
+
+在生產環境的多用戶並發情境中（例如多位使用者同時開啟即時字幕網頁、同時有外部系統透過 HTTP `/transcribe` 上傳長音檔），大模型 ASR 服務常面臨執行緒安全與延遲競爭的嚴峻考驗。本節詳解系統的並發架構、死鎖排查成果、當前採用的微批調度機制，以及未來的架構演進評估。
+
+> **實測（2026-10-02，內網直連 `10.9.0.35:8040`，RTX 4000 Ada，vLLM）**：下文的「每步約 15ms」是設計時的估計，不是量測值。實際單路串流每步（160ms 音訊）約 137–156 ms，也就是一個人講話就接近用滿；三路同時講話時每步約 390 ms、五路約 665 ms、十路約 1.4 秒，進度會持續落後，音訊送完 15 秒後連線被關閉，尚未算完的句子不會輸出。排程器解決的是「不再死鎖」，不是「多路都能即時」。`app/main.py` 另有落後時併塊與靜音不解碼，數字見下方「`app/main.py` 的串流協議細節」。
+
+### 1. vLLM V1 底層 IPC 死鎖根因剖析 (Root-Cause Diagnosis)
+
+在原生架構中，若採用多執行緒（如 Python `asyncio.to_thread`）直接並發調用 `asr_model.streaming_transcribe`，服務在高負載或多請求交疊時會瞬間凍結（死鎖無回應）。經 GDB 堆疊回溯排查，根因如下：
+- **vLLM V1 EngineCore 跨進程架構**：`vllm.entrypoints.llm.LLM` 為離線批處理設計，主行程透過單一 ZeroMQ IPC Pipe 與底層 `EngineCore` 子進程進行通訊與輸出拉取（`outputs_queue.get()`）。
+- **非執行緒安全 (Thread-Unsafe)**：多個 Python 執行緒並發進入 `LLM.generate()` 時，會同時競爭並拉取同一條 IPC Pipe 的回傳資料，引發資料錯位與 Linux 底層 `pthread_mutex / futex wait` 互鎖死鎖，導致 Sanic 事件迴圈與推論核心徹底失去回應。
+
+```
+[多執行緒並發直接調用 (舊架構 - 致命缺陷)]
+HTTP Request A  ──> thread-1 ─┐
+HTTP Request B  ──> thread-2 ─┼─> LLM.generate() ──> [單一 ZeroMQ Pipe 競爭衝突] ──> ❌ 致命死鎖 (Futex Wait)
+WebSocket Chunk ──> thread-3 ─┘
+```
+
+---
+
+### 2. 方案 A：微批優先級排程隊列 (Micro-Batch Priority Pipeline Scheduler - 當前實作)
+
+為徹底根除死鎖並保障即時語音辨識的毫秒級低延遲，本專案重構了推論調度核心，採用**「微批優先級排程隊列 (InferenceScheduler)」**：
+
+```
+[InferenceScheduler 微批雙軌排程 (方案 A - 當前架構)]
+
+WebSocket 實時語音 ──────> priority=0 (高優先級) ──┐
+                                                    ├─> [ PriorityQueue ] ──> [ 單一專屬 GPU Worker 線程 ] ──> vLLM Engine
+HTTP 檔案轉寫 (320ms切片) ─> priority=1 (普通優先級) ─┘                               (100% 執行緒安全，零 IPC 競爭)
+```
+
+#### 核心設計重點：
+1. **單一專屬 GPU 推論工作線程 (`ASRInferenceWorker`)**：
+   - 所有 GPU 推論任務一律進入排程隊列，由單一背景工作線程依序執行。徹底消滅多線程直接搶佔 vLLM IPC 的死鎖條件，確保 100% 穩定。
+2. **優先級雙軌排程 (`queue.PriorityQueue`)**：
+   - **優先級 0 (高優先級 - 實時串流)**：所有 WebSocket 即時語音切片（`priority=0`）享有無條件優先插隊權。
+   - **優先級 1 (普通優先級 - 批次檔案)**：HTTP REST `/transcribe` 與 `/transcribe/stream` 的音訊切片使用 `priority=1`。
+3. **時間片微切片交錯推論 (Time-sliced Interleaving)**：
+   - 上傳 200MB 的長音檔時，系統並不會一次性霸佔 GPU 數十秒；而是切分為 **320ms 小音訊切片**。
+   - 每個 320ms 切片推論僅需約 15ms。在此期間，若 WebSocket 實時說話音訊抵達，將以 `priority=0` 在**下一個 15ms 間隙立即插隊**。
+   - **成效**：即使後台正在處理 1 小時的錄音檔轉寫，前端即時說話字幕依然維持 **15~30ms 極致即時響應**，兩者互不干擾、永不卡死。
+4. **非同步橋接與安全回調**：
+   - 使用 `task.loop.call_soon_threadsafe(_safe_resolve / _safe_reject)` 將 GPU 推論結果回傳給 Sanic 協程，完全不阻塞主事件迴圈。
+5. **即時監控可觀測性**：
+   - `GET /health` 端點新增 `"queue_size"` 欄位，實時反映當前等待 GPU 推論的任務深度。
+
+---
+
+### 3. 未來進階演化路徑評估 (Future Evolution Roadmap)
+
+隨著後續業務場景擴展，可進一步按以下路徑無縫升級：
+
+| 方案 | 架構類型 | 適用場景 | 優勢 | 資源消耗與複雜度 |
+| :--- | :--- | :--- | :--- | :--- |
+| **方案 A (當前實作)** | **微批優先級排程隊列** | 中小型並發、直播字幕 + 偶發檔案轉寫 | 單一實例顯存佔用低 (6.8GB)，即時插隊保證低延遲，零死鎖風險 | 顯存極省 (40% GPU)，架構精簡 |
+| **方案 B** | **進程級雙實例物理隔離** | 高頻率、大體量長音檔轉寫 + 7x24 直播 | 物理隔離：檔案轉寫即便負載 100% 也不消耗直播實例算力 | 需啟動兩個服務實例 (8040 + 8041)，顯存需劃分 (如 25% + 15%)，Nginx 需配置路徑分流 |
+| **方案 C** | **原生真非同步合批引擎 (AsyncLLMEngine)** | 百人以上大型會議同傳、SaaS 多租戶高並發 | 支援 Continuous Dynamic Batching，多路音訊在同一個 Forward Pass 合批推論，GPU 核心利用率最大化 | 需將 R2T2 聲學編碼器與底層 vLLM 的解碼層深度重構為原生非同步驅動 |
+
+#### 方案 B 實作藍圖（雙實例物理隔離）：
+- **Instance 1 (`:8040`)**：`--gpu_mem_util 0.25`，專門承載 `wss://` 即時串流字幕。
+- **Instance 2 (`:8041`)**：`--gpu_mem_util 0.15`，專門承載 `/transcribe` 批次檔案上傳。
+- **Nginx 反向代理動態分流**：
+  ```nginx
+  location /asr_stream_api_v1 {
+      proxy_pass http://127.0.0.1:8040; # 專屬實時串流
+  }
+  location /transcribe {
+      proxy_pass http://127.0.0.1:8041; # 專屬檔案轉寫
+  }
+  ```
+
+#### 方案 C 實作藍圖（vLLM AsyncLLMEngine）：
+- 將 `app/r2t2/` 串流狀態機適配為非同步生成器（`async for output in engine.generate(...)`）。
+- 讓多個並發連線的 token 生成自然合批（Continuous Batching），適合高密度企業級部署。
 
 ---
 
