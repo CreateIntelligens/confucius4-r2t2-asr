@@ -9,7 +9,7 @@ event loop or calling the engine concurrently.
 
 import logging
 import time
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -21,6 +21,7 @@ from textproc import (
     detect_hallucination,
     is_chinese_token,
     keep_streamed_ending,
+    language_from_text,
     split_text_to_tokens,
 )
 from vad import StreamVad
@@ -41,6 +42,11 @@ RECENT_TOKENS = 10
 UNFIXED_TOKEN_NUM = 1
 # 一句超過這個長度就不做句末重辨識，直接用串流結果。
 FINAL_PASS_MAX_SAMPLES = 30 * SAMPLE_RATE
+# 自動判斷語言時，短於這個長度的句子（「OK」「Sí」）判出的語言不拿來切換串流語言，
+# 太短的音訊判錯機率高，切錯會讓下一整句的串流字幕變亂碼。
+AUTO_SWITCH_MIN_SAMPLES = int(1.5 * SAMPLE_RATE)
+# 以 Chinese 解碼時英文會照實輸出，所以判出英文也不必切換，中英混講才不會來回切。
+STREAMS_AS_CHINESE = {"Chinese", "English"}
 
 
 def unfixed_tail(state) -> str:
@@ -60,6 +66,16 @@ class StreamSession:
     pass. Streaming commits text before it has heard the rest of the
     sentence and cannot take it back, so the one-pass result is the more
     accurate of the two and is what a client should keep.
+
+    With ``auto_languages`` set the client did not pick a language. The
+    model's own streaming detection settles on a language within the first
+    fraction of a second and never revisits it, so instead each sentence
+    streams in the current language and the end-of-sentence pass detects
+    the language from the whole sentence. That detection is reported as
+    ``language`` and becomes the streaming language from the next sentence
+    on. A detection outside ``auto_languages`` is not trusted (accented
+    Mandarin and Taiwanese get detected as Portuguese): the sentence is
+    re-decoded in the first candidate instead.
     """
 
     def __init__(
@@ -73,12 +89,14 @@ class StreamSession:
         vad: Optional[StreamVad] = None,
         final_pass: bool = True,
         output_script: str = DEFAULT_OUTPUT_SCRIPT,
+        auto_languages: Sequence[str] = (),
     ) -> None:
         self._model = model
         self._gate = gate
         self._request_id = request_id
         self._context = context
-        self._language = language
+        self._auto_languages = list(auto_languages)
+        self._language = self._auto_languages[0] if self._auto_languages else language
         self._vad = vad
         self._final_pass = final_pass
         self._output_script = output_script
@@ -166,7 +184,7 @@ class StreamSession:
         tail = self._buf
         self._buf = np.zeros((0,), dtype=np.float32)
         if not self._in_speech or (self._state is None and tail.shape[0] == 0):
-            return self._wrap({"text": "", "reset": True, "final_text": ""})
+            return self._wrap({"text": "", "reset": True, "final_text": "", "language": ""})
         first_delta = self._decode(tail) if tail.shape[0] else ""
         return self._wrap(
             self._localize(self._close_segment(still_speaking=False, first_delta=first_delta))
@@ -267,6 +285,7 @@ class StreamSession:
         tail = "" if hallucinated else unfixed_tail(self._state)
         streamed = detect_and_fix_repetitions(self._sent_text + tail)
         final_text = streamed
+        language = self._language
         did_final_pass = False
         if (
             self._final_pass
@@ -275,14 +294,23 @@ class StreamSession:
         ):
             audio = np.concatenate(self._seg_audio)
             try:
-                with self._gate.run():
-                    result = self._model.transcribe(
-                        audio=[(audio, SAMPLE_RATE)],
-                        context=self._context,
-                        language=[self._language] if self._language else None,
-                        return_time_stamps=False,
-                    )
-                final_text = keep_streamed_ending(clean_transcript(result[0].text), streamed)
+                if self._auto_languages:
+                    result = self._transcribe(audio, None)
+                    language = language_from_text(result.language, result.text)
+                    if language not in self._auto_languages:
+                        log.info(
+                            "requestId=%s: detected %r is not a candidate, re-decoding as %s",
+                            self._request_id,
+                            language,
+                            self._auto_languages[0],
+                        )
+                        language = self._auto_languages[0]
+                        result = self._transcribe(audio, language)
+                    elif self._seg_samples >= AUTO_SWITCH_MIN_SAMPLES:
+                        self._switch_streaming_language(language)
+                else:
+                    result = self._transcribe(audio, self._language)
+                final_text = keep_streamed_ending(clean_transcript(result.text), streamed)
                 did_final_pass = True
             except Exception:
                 log.exception("requestId=%s: final pass failed, keeping streamed text", self._request_id)
@@ -299,4 +327,23 @@ class StreamSession:
             "reset": True,
             "final_text": final_text,
             "final_pass": did_final_pass,
+            "language": language or "",
         }
+
+    def _transcribe(self, audio: np.ndarray, language: Optional[str]):
+        """One-pass decode of a whole sentence; ``language=None`` detects it."""
+        with self._gate.run():
+            return self._model.transcribe(
+                audio=[(audio, SAMPLE_RATE)],
+                context=self._context,
+                language=[language] if language else None,
+                return_time_stamps=False,
+            )[0]
+
+    def _switch_streaming_language(self, detected: str) -> None:
+        nxt = detected
+        if detected in STREAMS_AS_CHINESE and "Chinese" in self._auto_languages:
+            nxt = "Chinese"
+        if nxt != self._language:
+            log.info("requestId=%s: streaming language %s -> %s", self._request_id, self._language, nxt)
+            self._language = nxt

@@ -70,6 +70,7 @@
    - 所有模型呼叫（批次與串流）共用同一個排隊鎖並在執行緒中執行，多路連線互相輪流、不會卡死事件迴圈；推論落後時自動併塊追進度。
    - 每條連線有獨立的 VAD 狀態；偵測到語音才開始解碼，靜音不佔 GPU。
    - 每句結束時附上整句重新辨識的 `final_text`，修正串流邊聽邊出字造成的句首雜字與同音誤判。
+   - 不必先指定語言：串流逐句自動判斷語言（中、英、日、韓、西），句末回報判出的語言，下一句起串流跟著切換。
 
 ---
 
@@ -412,14 +413,23 @@ curl https://asr.5gao.ai/health
   | :--- | :--- | :--- |
   | `requestId` | 是 | 任意識別字串，回應會原樣帶回 |
   | `secret_key` | 是 | 需在 `STREAM_SECRET_KEYS` 內，否則以 4401 關閉連線 |
-  | `language` | 否 | `zhen`（中英混講，預設）、`zh`、`en`、`Chinese`、`English`、`Cantonese`… 或 `auto`。`zhen` 會以 Chinese 解碼，夾雜的英文仍會照實輸出；`auto` 由模型自行判斷，短句容易判錯語言，不建議 |
+  | `language` | 否 | 不填、`zhen` 或 `auto`：逐句自動判斷語言（見下方說明）。填 `zh`、`en`、`ja`、`Chinese`、`English`、`Cantonese`… 則固定用該語言解碼，不做判斷 |
+  | `languages` | 否 | 自動判斷時信任的語言清單，例如 `["zh", "en", "es"]`；預設為 `STREAM_AUTO_LANGUAGES`（Chinese、English、Japanese、Korean、Spanish）。指定了具體 `language` 時忽略 |
   | `use_vad` | 否 | 預設 `true`，以 VAD 自動斷句 |
   | `system_prompt` | 否 | 熱詞或上下文提示，最多 4000 字 |
   | `smooth` | 否 | `true` 時要求模型輸出較通順的文字 |
   | `final_pass` | 否 | 預設 `true`，句末整句重新辨識並放在 `final_text` |
   | `output_script` | 否 | `simplified`（預設）或 `traditional`（台灣繁體，OpenCC `s2twp`）。繁體時每一步都以整句累積的文字轉換再送出新增部分，被拆在兩則訊息裡的詞（软、件）仍會轉成慣用語（軟體）；`final_text` 以整句轉換，為定稿 |
 
-  握手成功後伺服器回 `{"status": "connected", "language": "Chinese", "vad": true, ...}`；header 有誤則回 `{"status": "error", "msg": "..."}` 並關閉連線。
+  握手成功後伺服器回 `{"status": "connected", "language": "auto", "languages": ["Chinese", "English", ...], "vad": true, ...}`（指定語言時 `language` 為該語言、`languages` 為空）；header 有誤則回 `{"status": "error", "msg": "..."}` 並關閉連線。
+- **自動判斷語言**：
+  模型串流時的語言判斷只看開頭不到一秒的音訊，定下來就不再改，常判錯（帶口音的華語、台語曾被當成葡萄牙文），所以不直接用。實際做法：
+  1. 每一句的串流字幕用「目前語言」解碼，連線開始時是清單的第一個（預設 Chinese）。
+  2. 句末整句重新辨識時讓模型自行判斷，`final_text` 就是這次的結果，判出的語言放在句末訊息的 `language`。模型常把華語標成 English，所以語言以實際寫出的文字為準：有韓文字母為 Korean、有假名為 Japanese、有漢字為 Chinese。
+  3. 判出清單外的語言時不採信，改用清單第一個語言重新辨識這一句。
+  4. 判出的語言從下一句起成為串流語言。判出 English 時仍以 Chinese 串流（Chinese 解碼會照實輸出英文，中英混講才不會來回切換）；短於 1.5 秒的句子不拿來切換。
+
+  所以講者換語言時，換過去的第一句串流字幕會是亂的，那句的 `final_text` 仍正確，下一句起串流就跟上。2026-10-05 在 .37 以 edge-tts 合成的中、英、西、日、韓、中英混講各一句實測，六句的 `final_text` 與 `language` 全部正確；固定 Chinese 時日文被翻成中文、韓文串流時被翻成中文。
 - **音訊傳輸 (Binary Chunks)**：
   客戶端每 160ms 發送 16kHz 16-bit Mono PCM raw binary（5,120 bytes / 2,560 samples）。
 - **服務端即時響應 (JSON)**：
@@ -445,12 +455,13 @@ curl https://asr.5gao.ai/health
       "reset": true,
       "final_text": "整句重新辨識後的文字",
       "final_pass": true,
+      "language": "Chinese",
       "asr_cost_ms": 310.2,
       "total_cost_ms": 314.9
     }
   }
   ```
-  **請以 `final_text` 作為這一句的定稿。** 串流是邊聽邊出字，已送出的字無法收回，句首偶爾會多出雜字或聽錯同音字；`final_text` 是整句聽完後一次辨識的結果；若一次辨識漏掉串流已經送出的句尾，會自動接回。`final_pass` 為 `false` 表示這句沒有重新辨識（單句超過 30 秒、或因重複幻覺被強制斷句），此時 `final_text` 就是串流累積的文字。
+  **請以 `final_text` 作為這一句的定稿。** 串流是邊聽邊出字，已送出的字無法收回，句首偶爾會多出雜字或聽錯同音字；`final_text` 是整句聽完後一次辨識的結果；若一次辨識漏掉串流已經送出的句尾，會自動接回。`final_pass` 為 `false` 表示這句沒有重新辨識（單句超過 30 秒、或因重複幻覺被強制斷句），此時 `final_text` 就是串流累積的文字。`language` 是這句的語言：自動判斷時為判出的語言，指定語言時就是該語言，沒有重新辨識時為當時的串流語言。
 - **結束串流**：
   送出文字訊息 `YOUDAO_ONETIME_ASR_STREAM_EOS`（全大寫，原樣送出，不是 JSON）。伺服器會回最後一則 `reset: true` 訊息後關閉連線。連續 120 秒沒有收到資料也會關閉。
 - **連線數上限**：
@@ -461,7 +472,7 @@ curl https://asr.5gao.ai/health
   伺服器先送 `{"status": "error", "requestId": "...", "msg": "inference failed: ..."}`，再以關閉碼 `1011` 結束連線；正常結束的關閉碼是 `1000`。
 - **同時多路**：
   多條連線共用一個模型、輪流推論。Transformers 後端在 GB10 上單路每步約 0.1 秒；三路同時講話時斷句約晚 0.3–1.7 秒，五路約晚 1.4–3.3 秒（2026-10-01 實測，每路都在同一時間講話的最壞情況）。
-- `server.py`（Sanic + vLLM 專用）提供同一協議，但沒有 `final_text`。
+- `server.py`（Sanic + vLLM 專用）提供同一協議，但沒有 `final_text`，也沒有逐句自動判斷：`zhen` 以 Chinese 解碼。
 
 ### `app/main.py` 的一次性轉寫 (`POST /transcribe`)
 ```bash
@@ -493,7 +504,8 @@ curl -F file=@audio.wav -F language=zhen -F context="鶴記企業、沉水泵" h
 | `WITH_LLAMA` | `1` | build 時是否編譯 llama.cpp 後端（僅 compose build） |
 | `VLLM_MAX_MODEL_LEN` | `2048` | vLLM 後端的最大序列長度 |
 | `VAD_HOST_DIR` | `./models/FireRedVAD` | 掛進容器 `/vad` 的宿主目錄（僅 compose） |
-| `STREAM_DEFAULT_LANGUAGE` | `zhen` | 串流 header 沒帶 `language` 時的預設值 |
+| `STREAM_DEFAULT_LANGUAGE` | `zhen` | 串流 header 沒帶 `language` 時的預設值；`zhen`／`auto` 為逐句自動判斷（`/ws/stream` 沒有斷句，`zhen` 仍以 Chinese 解碼） |
+| `STREAM_AUTO_LANGUAGES` | `Chinese,English,Japanese,Korean,Spanish` | 自動判斷時信任的語言，第一個是判出清單外語言時的退路 |
 | `STREAM_SECRET_KEYS` | `test0102` | 串流允許的 `secret_key`，逗號分隔 |
 | `STALL_SECONDS` | `60` | 單次推論超過此秒數，`/healthz` 回報 `stalled` |
 | `MAX_CONCURRENT_STREAMS` | `12` | 同時進行的即時串流上限，超過時以關閉碼 1013 拒絕新連線 |

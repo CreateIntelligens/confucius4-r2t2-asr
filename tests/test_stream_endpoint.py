@@ -184,3 +184,37 @@ def test_short_clips_are_treated_as_interactive(upload_client, monkeypatch, tmp_
     with open(clip, "rb") as f:
         client.post("/transcribe", files={"file": f})
     assert seen == [main.LIVE]
+
+
+@pytest.mark.parametrize("language", [None, "zhen", "auto"])
+def test_unset_zhen_and_auto_detect_per_sentence(client, language):
+    extra = {"language": language} if language else {}
+    with client.websocket_connect("/asr_stream_api_v1") as ws:
+        ws.send_text(header(**extra))
+        connected = json.loads(ws.receive_text())
+    assert connected["language"] == "auto"
+    # the default list is trimmed to what the model supports
+    assert connected["languages"] == ["Chinese", "English"]
+
+
+def test_header_can_narrow_the_candidates(client):
+    with client.websocket_connect("/asr_stream_api_v1") as ws:
+        ws.send_text(header(language="auto", languages=["en", "zh"]))
+        connected = json.loads(ws.receive_text())
+    assert connected["languages"] == ["English", "Chinese"]
+
+
+def test_a_specific_language_turns_detection_off(client):
+    with client.websocket_connect("/asr_stream_api_v1") as ws:
+        ws.send_text(header(language="en", languages=["zh"]))
+        connected = json.loads(ws.receive_text())
+    assert connected["language"] == "English"
+    assert connected["languages"] == []
+
+
+@pytest.mark.parametrize("languages", [["klingon"], ["auto"], "zh,,en", [1]])
+def test_bad_candidates_get_an_error_message(client, languages):
+    with client.websocket_connect("/asr_stream_api_v1") as ws:
+        ws.send_text(header(language="auto", languages=languages))
+        msg = json.loads(ws.receive_text())
+    assert msg["status"] == "error"

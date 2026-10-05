@@ -20,6 +20,8 @@ class FakeModel:
         self.final = final
         self.steps = []
         self.transcribed = []
+        # what auto-detection returns, one entry per language=None call
+        self.detected = []
 
     def init_streaming_state(self, **kwargs):
         return SimpleNamespace(
@@ -53,7 +55,8 @@ class FakeModel:
 
     def transcribe(self, audio, context="", language=None, return_time_stamps=False):
         self.transcribed.append((len(audio[0][0]), context, language))
-        return [SimpleNamespace(text=self.final)]
+        detected = language[0] if language else self.detected.pop(0)
+        return [SimpleNamespace(text=self.final, language=detected)]
 
 
 class FakeVad:
@@ -180,7 +183,7 @@ def test_finish_without_speech_returns_empty_reset():
     session = make(model, FakeVad(start_at=99, end_at=99))
     session.feed(chunks(3))
     end = session.finish()["msg"]
-    assert end == {"text": "", "reset": True, "final_text": ""}
+    assert end == {"text": "", "reset": True, "final_text": "", "language": ""}
     assert model.steps == []
 
 
@@ -229,3 +232,102 @@ def feed_one_by_one_raw(session, n):
     for _ in range(n):
         msgs += session.feed(chunks(1))
     return msgs
+
+
+class SentenceVad:
+    """Sentences of ``length`` chunks separated by ``gap`` chunks of silence."""
+
+    def __init__(self, length, gap=2):
+        self.length, self.gap = length, gap
+        self.i = -1
+
+    def detect(self, chunk):
+        self.i += 1
+        pos = self.i % (self.length + self.gap)
+        return pos == 0, pos == self.length - 1
+
+
+def auto(model, length, languages=("Chinese", "English", "Spanish")):
+    return StreamSession(
+        model, InferGate(), request_id="r1", vad=SentenceVad(length), auto_languages=languages
+    )
+
+
+def sentence_ends(session, sentences, length):
+    msgs = feed_one_by_one(session, sentences * (length + 2))
+    return [m for m in msgs if m["reset"]]
+
+
+def stream_languages(model):
+    return [s.kwargs["language"] for s in model.states]
+
+
+def track_states(model):
+    model.states = []
+    create = model.init_streaming_state
+
+    def init(**kwargs):
+        state = create(**kwargs)
+        model.states.append(state)
+        return state
+
+    model.init_streaming_state = init
+
+
+def test_auto_streams_in_the_first_candidate_and_detects_at_sentence_end():
+    model = FakeModel(final="Vamos al museo.")
+    model.detected = ["Spanish", "Spanish"]
+    track_states(model)
+    length = 12  # 12 * 160ms, long enough to be trusted
+    ends = sentence_ends(auto(model, length), 2, length)
+
+    assert [t[2] for t in model.transcribed] == [None, None]
+    assert [e["language"] for e in ends] == ["Spanish", "Spanish"]
+    # the first sentence streams before anything is known; the next follows the detection
+    assert stream_languages(model) == ["Chinese", "Spanish"]
+
+
+def test_english_keeps_streaming_as_chinese():
+    """Chinese decoding writes English words as they are, so zh/en mixing never flips."""
+    model = FakeModel(final="Send the report.")
+    model.detected = ["English", "Chinese"]
+    track_states(model)
+    ends = sentence_ends(auto(model, 12), 2, 12)
+    assert [e["language"] for e in ends] == ["English", "Chinese"]
+    assert stream_languages(model) == ["Chinese", "Chinese"]
+
+
+def test_detection_outside_the_candidates_falls_back_to_the_first():
+    model = FakeModel(final="Obrigado.")
+    model.detected = ["Portuguese"]
+    track_states(model)
+    ends = sentence_ends(auto(model, 12), 1, 12)
+    assert ends[0]["language"] == "Chinese"
+    assert ends[0]["final_text"] == model.final
+    # detected once, then re-decoded in the fallback
+    assert [t[2] for t in model.transcribed] == [None, ["Chinese"]]
+
+
+def test_short_sentences_do_not_switch_the_streaming_language():
+    model = FakeModel(final="Sí.")
+    model.detected = ["Spanish", "Chinese"]
+    track_states(model)
+    ends = sentence_ends(auto(model, 4), 2, 4)  # 4 * 160ms
+    assert ends[0]["language"] == "Spanish"
+    assert stream_languages(model) == ["Chinese", "Chinese"]
+
+
+def test_forced_language_is_never_detected():
+    model = FakeModel()
+    session = make(model, FakeVad(start_at=0, end_at=3))
+    end = [m for m in feed_one_by_one(session, 5) if m["reset"]][0]
+    assert end["language"] == "Chinese"
+    assert [t[2] for t in model.transcribed] == [["Chinese"]]
+
+
+def test_chinese_tagged_as_english_is_reported_as_chinese():
+    """The model tags Mandarin as English; the written script decides."""
+    model = FakeModel(final="今天下午開會。")
+    model.detected = ["English"]
+    end = sentence_ends(auto(model, 12), 1, 12)[0]
+    assert end["language"] == "Chinese"

@@ -4,6 +4,7 @@ from textproc import (
     clean_transcript,
     detect_hallucination,
     keep_streamed_ending,
+    language_from_text,
     normalize_language,
 )
 
@@ -67,3 +68,20 @@ def test_keep_streamed_ending_leaves_a_complete_final_alone():
     # texts that do not line up: trust the one-pass result
     assert keep_streamed_ending("我想了解 DIVA PRO", "我想了解diypro的差別") == "我想了解 DIVA PRO"
     assert keep_streamed_ending("", "好") == ""
+
+
+@pytest.mark.parametrize(
+    "detected, text, expected",
+    [
+        ("English", "今天下午三点开会", "Chinese"),
+        ("English", "这个专栏的deadline是下礼拜三", "Chinese"),
+        ("Cantonese", "我哋今日去邊度", "Cantonese"),
+        ("English", "오늘 저녁에 영화를 봐요", "Korean"),
+        ("Chinese", "明日の朝9時に駅の前で", "Japanese"),
+        ("Spanish", "Mañana vamos al museo", "Spanish"),
+        ("English", "Please send the report", "English"),
+        ("", "", ""),
+    ],
+)
+def test_language_follows_the_script_the_model_wrote(detected, text, expected):
+    assert language_from_text(detected, text) == expected

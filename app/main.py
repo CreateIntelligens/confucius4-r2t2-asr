@@ -24,7 +24,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -51,7 +51,7 @@ from infer_gate import BATCH, LIVE, InferGate
 from r2t2 import R2T2ASRModel
 from script_convert import convert_text, resolve_output_script
 from stream_session import StreamSession, unfixed_tail
-from textproc import clean_transcript, normalize_language
+from textproc import AUTO_LANGUAGES, clean_transcript, normalize_language
 from vad import load_vad_factory
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/model")
@@ -65,8 +65,15 @@ AUTO_DOWNLOAD = os.environ.get("AUTO_DOWNLOAD", "1") == "1"
 AUTO_WARMUP = os.environ.get("AUTO_WARMUP", "1") == "1"
 GPU_MEM_UTIL = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.35"))
 VAD_DIR = os.environ.get("VAD_DIR", os.path.join(MODEL_DIR, "FireRedVAD"))
-# 串流沒指定語言時用的預設值；「zhen」（中英混講）會對應成 Chinese，要自動判斷請設 auto。
+# 串流沒指定語言時用的預設值。/asr_stream_api_v1 把 zhen、auto 都當成逐句自動判斷；
+# /ws/stream 沒有斷句，zhen 仍以 Chinese 解碼。
 STREAM_DEFAULT_LANGUAGE = os.environ.get("STREAM_DEFAULT_LANGUAGE", "zhen")
+# 逐句自動判斷時信任的語言，第一個是判出清單外語言時的退路。
+# 不放葡萄牙文等：帶口音的華語、台語常被判成那些語言。
+STREAM_AUTO_LANGUAGES = os.environ.get(
+    "STREAM_AUTO_LANGUAGES", "Chinese,English,Japanese,Korean,Spanish"
+)
+STREAM_AUTO_CODES = ("zhen",) + AUTO_LANGUAGES
 STREAM_SECRET_KEYS = {
     k.strip()
     for k in os.environ.get("STREAM_SECRET_KEYS", "test0102").split(",")
@@ -374,6 +381,31 @@ def _resolve_language(model, language: Optional[str], default: Optional[str] = N
     return lang
 
 
+def _stream_languages(model, header: dict) -> Tuple[Optional[str], List[str]]:
+    """Header -> (forced language, auto-detect candidates); exactly one is set."""
+    raw = header.get("language") or STREAM_DEFAULT_LANGUAGE
+    if str(raw).strip().lower() not in STREAM_AUTO_CODES:
+        return _resolve_language(model, raw), []
+    codes = header.get("languages")
+    if not codes:
+        # 伺服器設定的清單只留這個模型支援的，不讓設定檔害每條連線都失敗。
+        supported = set(model.get_supported_languages())
+        default = [normalize_language(c) for c in STREAM_AUTO_LANGUAGES.split(",") if c.strip()]
+        return None, list(dict.fromkeys(c for c in default if c in supported)) or ["Chinese"]
+    if isinstance(codes, str):
+        codes = codes.split(",")
+    if not isinstance(codes, list) or not all(isinstance(c, str) for c in codes):
+        raise ValueError("languages must be a list of language codes")
+    candidates = []
+    for code in codes:
+        lang = _resolve_language(model, code) if code.strip() else None
+        if lang is None:
+            raise ValueError(f"languages cannot contain {code!r}")
+        if lang not in candidates:
+            candidates.append(lang)
+    return None, candidates
+
+
 def _batch_language(model, language: Optional[str]) -> Optional[str]:
     try:
         return _resolve_language(model, language)
@@ -658,7 +690,7 @@ async def asr_stream_api_v1(websocket: WebSocket):
         return
     try:
         context = _stream_context(header)
-        language = _resolve_language(model, header.get("language"), STREAM_DEFAULT_LANGUAGE)
+        language, auto_languages = _stream_languages(model, header)
         output_script = resolve_output_script(header.get("output_script"))
     except ValueError as exc:
         await send({"status": "error", "requestId": f"{request_id}", "msg": str(exc)})
@@ -689,6 +721,7 @@ async def asr_stream_api_v1(websocket: WebSocket):
         vad=vad_factory.new() if use_vad else None,
         final_pass=bool(header.get("final_pass", True)),
         output_script=output_script,
+        auto_languages=auto_languages,
     )
 
     eos, stop = object(), object()
@@ -721,6 +754,7 @@ async def asr_stream_api_v1(websocket: WebSocket):
                 "msg": "",
                 "active_connections": STATE["active_streams"],
                 "language": language or "auto",
+                "languages": auto_languages,
                 "vad": use_vad,
                 "output_script": output_script,
             }

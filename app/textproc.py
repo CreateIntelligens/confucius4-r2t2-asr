@@ -62,6 +62,27 @@ def normalize_language(
     return raw[:1].upper() + raw[1:].lower()
 
 
+_HANGUL_RE = re.compile(r"[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]")
+_KANA_RE = re.compile(r"[\u3040-\u30ff]")
+_HAN_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+
+
+def language_from_text(detected: str, text: str) -> str:
+    """Correct the model's language tag using the script it actually wrote.
+
+    The model often tags Mandarin (with or without English mixed in) as
+    "language English" while writing the Chinese correctly, so the text is
+    the more reliable signal whenever it is not plain Latin script.
+    """
+    if _HANGUL_RE.search(text):
+        return "Korean"
+    if _KANA_RE.search(text):
+        return "Japanese"
+    if _HAN_RE.search(text):
+        return detected if detected == "Cantonese" else "Chinese"
+    return detected
+
+
 def detect_and_fix_repetitions(text: str, threshold: int = 4) -> str:
     """
     清洗大模型自回歸解碼時因靜音、雜音引發的跳針與重複幻覺。
