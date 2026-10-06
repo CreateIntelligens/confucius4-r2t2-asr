@@ -337,6 +337,9 @@ STEP_MS = int(CHUNK_ASR_SECONDS * 1000)
 LOOKAHEAD_MS = 160
 UNFIX_TOKEN_NUM = 1
 MAX_TOKENS = 10
+# 推論跟不上送音節奏時（多路同時講話），一步最多併 8 個 chunk（1.28 秒）追進度。
+# 每一步都會重送整句音訊，運算量幾乎不隨 chunk 長度增加，逐塊算只會越拖越久。
+MAX_CATCHUP_CHUNKS = 8
 ERROR_MSG_NO_HEADER = "json header is expected"
 MAX_SYSTEM_PROMPT_CHARS = 4000
 MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "12"))
@@ -962,78 +965,78 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
             last_fixed_asr_text = ""
             ws_closed = False
 
+            async def run_vad(audio_chunk):
+                """Streaming VAD in a thread, never blocking the Sanic event loop."""
+                if not (use_vad and conn_vad is not None):
+                    return False, 0.0
+                audio_chunk_int16 = (audio_chunk * 32768.0).clip(-32768, 32767).astype(np.int16)
+                t0 = time.time()
+                chunk_results = await asyncio.to_thread(conn_vad.detect_chunk, audio_chunk_int16)
+                ended = any(r.is_speech_end for r in chunk_results)
+                return ended, (time.time() - t0) * 1000
+
             while True:
                 data = await recv_queue.get()
                 if data is _STOP:
                     break
 
-                recv_time = time.time()
+                # 推論落後時佇列會積壓好幾塊音訊：一次全部取走，下面再併成較大的 chunk 追進度。
+                items = [data]
+                while not recv_queue.empty():
+                    items.append(recv_queue.get_nowait())
+                got_eos = any(isinstance(i, str) and i == YOUDAO_ONETIME_ASR_EOS_STRING for i in items)
+                got_stop = any(i is _STOP for i in items)
 
-                if isinstance(data, str):
-                    if data == YOUDAO_ONETIME_ASR_EOS_STRING:
-                        first_max_new_tokens = max(1, int((step + lookahead) / 1280))
-                        text = await inference_scheduler.submit(
-                            asr_model.finish_streaming_transcribe_no_reset,
-                            asr_state,
-                            first_max_new_tokens,
-                            priority=0,
-                        )
-                        text = text.split("|")[0]
-                        if len(text) > len(last_fixed_asr_text):
-                            new_asr_text = text[len(last_fixed_asr_text):]
-                        else:
-                            new_asr_text = ""
-                        out_msg = {"text": new_asr_text, "reset": True}
-                        out_msg["text"] = _convert_output_text(out_msg["text"], output_script)
-                        out_str = {"status": "success", "requestId": f"{requestId}", "msg": out_msg}
-                        await ws.send(json.dumps(out_str, ensure_ascii=False))
-                        await ws.close()
-                        break
-                    else:
+                for item in items:
+                    if not isinstance(item, (bytes, bytearray)):
                         continue
-
-                if is_first_seg:
-                    is_wav = if_contains_wav_header(data)
-                    audio_seg = read_pcm(data, is_wav)
-                    is_first_seg = False
-                else:
-                    audio_seg = read_pcm(data)
-
-                audio_buf = np.concatenate((audio_buf, audio_seg))
+                    if is_first_seg:
+                        audio_seg = read_pcm(item, if_contains_wav_header(item))
+                        is_first_seg = False
+                    else:
+                        audio_seg = read_pcm(item)
+                    audio_buf = np.concatenate((audio_buf, audio_seg))
                 audio_buf_len = len(audio_buf)
-                if is_first and audio_buf_len < int(step + lookahead):
+                if is_first and audio_buf_len < int(step + lookahead) and not got_eos:
                     await ws.send(json.dumps({}))
+                    if got_stop:
+                        break
                     continue
 
                 #-------- Iterate over audio_buf --------#
-                while audio_buf_len - tmp_audio_pointer >= CHUNK_ASR_SIZE:
+                while audio_buf_len - tmp_audio_pointer >= CHUNK_ASR_SIZE and not (
+                    is_first and audio_buf_len < int(step + lookahead)
+                ):
                     if is_first:
-                        asr_state.chunk_size_sec = (step + lookahead) / sr
-                        chunk_size_samples = int(round(float(asr_state.chunk_size_sec) * sr))
-                        asr_state.chunk_size_samples = max(1, chunk_size_samples)
                         audio_chunk = audio_buf[tmp_audio_pointer : tmp_audio_pointer + step + lookahead]
                         is_first = False
                         total_secs += (step + lookahead) / sr
                         tmp_audio_pointer = step + lookahead
+                        speech_ended_in_this_chunk, vad_cost_ms = await run_vad(audio_chunk)
+                        n_chunks = 1
                     else:
-                        asr_state.chunk_size_sec = CHUNK_ASR_SECONDS
-                        chunk_size_samples = int(round(float(asr_state.chunk_size_sec) * sr))
-                        asr_state.chunk_size_samples = max(1, chunk_size_samples)
-                        audio_chunk = audio_buf[tmp_audio_pointer : tmp_audio_pointer + CHUNK_ASR_SIZE]
-                        tmp_audio_pointer += CHUNK_ASR_SIZE
-                        total_secs += CHUNK_ASR_SECONDS
-
-                    # Streaming VAD (offloaded to thread to never block Sanic event loop)
-                    speech_ended_in_this_chunk = False
-                    vad_cost_ms = 0.0
-                    if use_vad and conn_vad is not None:
-                        audio_chunk_int16 = (audio_chunk * 32768.0).clip(-32768, 32767).astype(np.int16)
-                        t0 = time.time()
-                        chunk_results = await asyncio.to_thread(conn_vad.detect_chunk, audio_chunk_int16)
-                        for r in chunk_results:
-                            if r.is_speech_end:
-                                speech_ended_in_this_chunk = True
-                        vad_cost_ms = round((time.time() - t0) * 1000, 1)
+                        # VAD 仍逐塊判斷，句子一結束就停止併塊，不讓下一句混進這一步。
+                        pieces = []
+                        speech_ended_in_this_chunk = False
+                        vad_cost_ms = 0.0
+                        while (
+                            len(pieces) < MAX_CATCHUP_CHUNKS
+                            and audio_buf_len - tmp_audio_pointer >= CHUNK_ASR_SIZE
+                        ):
+                            piece = audio_buf[tmp_audio_pointer : tmp_audio_pointer + CHUNK_ASR_SIZE]
+                            tmp_audio_pointer += CHUNK_ASR_SIZE
+                            total_secs += CHUNK_ASR_SECONDS
+                            pieces.append(piece)
+                            ended, cost = await run_vad(piece)
+                            vad_cost_ms += cost
+                            if ended or total_secs >= MAX_CONTINUOUS_SPEECH_SEC:
+                                speech_ended_in_this_chunk = ended
+                                break
+                        audio_chunk = np.concatenate(pieces)
+                        n_chunks = len(pieces)
+                    vad_cost_ms = round(vad_cost_ms, 1)
+                    asr_state.chunk_size_sec = len(audio_chunk) / sr
+                    asr_state.chunk_size_samples = len(audio_chunk)
 
                     # Continuous speech limit: prevent vLLM max_model_len overflow
                     if total_secs >= MAX_CONTINUOUS_SPEECH_SEC:
@@ -1045,13 +1048,14 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                         asr_model.streaming_transcribe_no_reset,
                         audio_chunk,
                         asr_state,
-                        int(max_new_tokens),
+                        min(32, int(max_new_tokens) * n_chunks),
                         False,
                         priority=0,
                     )
                     fixed_asr_text = fixed_asr_text.split("|")[0]
                     asr_cost_ms = round((time.time() - t0) * 1000, 1)
 
+                    new_asr_text = ""
                     if len(fixed_asr_text) > len(last_fixed_asr_text):
                         new_asr_text = fixed_asr_text[len(last_fixed_asr_text):]
                         last_fixed_asr_text = fixed_asr_text
@@ -1094,7 +1098,8 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                             seg_new_asr_text = seg_final_text[len(last_fixed_asr_text):]
                         else:
                             seg_new_asr_text = ""
-                        out_msg = {"text": seg_new_asr_text, "reset": True, "asr_cost_ms": asr_cost_ms}
+                        # 這一步剛確定的字也要送出，句末訊息取代了一般訊息，少了它每句結尾會掉字。
+                        out_msg = {"text": new_asr_text + seg_new_asr_text, "reset": True, "asr_cost_ms": asr_cost_ms}
                         last_fixed_asr_text = ""
                         total_secs = 0.0
 
@@ -1149,6 +1154,28 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
                         await ws.send(json.dumps(out_str, ensure_ascii=False))
                     except Exception:
                         break
+
+                if got_eos:
+                    first_max_new_tokens = max(1, int((step + lookahead) / 1280))
+                    text = await inference_scheduler.submit(
+                        asr_model.finish_streaming_transcribe_no_reset,
+                        asr_state,
+                        first_max_new_tokens,
+                        priority=0,
+                    )
+                    text = text.split("|")[0]
+                    if len(text) > len(last_fixed_asr_text):
+                        new_asr_text = text[len(last_fixed_asr_text):]
+                    else:
+                        new_asr_text = ""
+                    out_msg = {"text": new_asr_text, "reset": True}
+                    out_msg["text"] = _convert_output_text(out_msg["text"], output_script)
+                    out_str = {"status": "success", "requestId": f"{requestId}", "msg": out_msg}
+                    await ws.send(json.dumps(out_str, ensure_ascii=False))
+                    await ws.close()
+                    break
+                if got_stop:
+                    break
 
         except Exception as e:
             logger.exception(f"requestId={requestId} error: {e}")

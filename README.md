@@ -472,7 +472,7 @@ curl https://asr.5gao.ai/health
   伺服器先送 `{"status": "error", "requestId": "...", "msg": "inference failed: ..."}`，再以關閉碼 `1011` 結束連線；正常結束的關閉碼是 `1000`。
 - **同時多路**：
   多條連線共用一個模型、輪流推論。Transformers 後端在 GB10 上單路每步約 0.1 秒；三路同時講話時斷句約晚 0.3–1.7 秒，五路約晚 1.4–3.3 秒（2026-10-01 實測，每路都在同一時間講話的最壞情況）。
-- `server.py`（Sanic + vLLM 專用）提供同一協議，但沒有 `final_text`，也沒有逐句自動判斷：`zhen` 以 Chinese 解碼。
+- `server.py`（Sanic + vLLM 專用）提供同一協議，但沒有 `final_text`，也沒有逐句自動判斷：`zhen` 以 Chinese 解碼。推論落後時同樣會把積壓的音訊併成一步（最多 8 塊、1.28 秒）：2026-10-05 在 A4000 + vLLM 實測，修正前 3 路時句末延遲從 4.4 秒一路拖到 13.8 秒、6 句掉 2 句（5 路掉 4 句）；修正後 3 路穩定在 1.3–1.5 秒、5 路 2.3–3.3 秒，6 句全收到。
 
 ### `app/main.py` 的一次性轉寫 (`POST /transcribe`)
 ```bash
