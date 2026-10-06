@@ -218,3 +218,22 @@ def test_bad_candidates_get_an_error_message(client, languages):
         ws.send_text(header(language="auto", languages=languages))
         msg = json.loads(ws.receive_text())
     assert msg["status"] == "error"
+
+
+def test_process_vram_counts_only_this_process(monkeypatch):
+    import os
+    import subprocess
+
+    out = f"{os.getpid()}, 4411\n99999, 30594\n{os.getpid()}, 100\n"
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=out))
+    assert main._process_vram_gb() == round(4511 / 1024, 2)
+
+
+def test_process_vram_is_unknown_without_nvidia_smi(monkeypatch):
+    import subprocess
+
+    def missing(*a, **k):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    assert main._process_vram_gb() is None

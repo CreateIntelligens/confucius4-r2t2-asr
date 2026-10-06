@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import platform
+import subprocess
 import tempfile
 import threading
 import time
@@ -293,6 +294,9 @@ class HealthResponse(BaseModel):
     arch: str
     gpu: Optional[str] = None
     vram_used_gb: float
+    # 這個行程在 GPU 上的實際總佔用（含 llama.cpp 與 PyTorch 保留未用的空間）；
+    # vram_used_gb 只算 PyTorch 正在用的，曾經藏住 2.6 GB 的浪費。
+    vram_process_gb: Optional[float] = None
     download_seconds: Optional[float] = None
     load_seconds: Optional[float] = None
     warmup_seconds: Optional[float] = None
@@ -301,6 +305,22 @@ class HealthResponse(BaseModel):
     vad_loaded: bool = False
     active_streams: int = 0
     inference: Optional[dict] = None
+
+
+def _process_vram_gb() -> Optional[float]:
+    """GPU memory held by this process as the driver sees it, or None if unknown."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pid = str(os.getpid())
+    mib = [int(m) for p, m in (line.split(",") for line in out.splitlines() if "," in line) if p.strip() == pid]
+    return round(sum(mib) / 1024, 2) if mib else None
 
 
 @app.get("/healthz", response_model=HealthResponse)
@@ -318,6 +338,7 @@ def healthz() -> HealthResponse:
         arch=STATE["arch"],
         gpu=STATE["gpu"],
         vram_used_gb=vram,
+        vram_process_gb=_process_vram_gb() if cuda else None,
         download_seconds=STATE["download_seconds"],
         load_seconds=STATE["load_seconds"],
         warmup_seconds=STATE["warmup_seconds"],

@@ -394,7 +394,7 @@ curl https://asr.5gao.ai/health
 ```
 `inference` 反映模型是否真的在動：`busy_seconds` 是目前這次推論已經跑了多久，超過 60 秒時 `status` 會變成 `stalled`（`server.py` 同時回 HTTP 503）；`waiting` 是正在排隊的呼叫數。
 
-`app/main.py` 的 `GET /healthz` 另外回報 `backend`、`arch`、`gpu`、`vram_used_gb`、`streaming`、`vad_loaded`、`active_streams`，正常時 `status` 為 `ok`、載入中為 `loading`。
+`app/main.py` 的 `GET /healthz` 另外回報 `backend`、`arch`、`gpu`、`vram_used_gb`（PyTorch 正在用的）、`vram_process_gb`（這個行程在 GPU 上的實際總佔用，含 llama.cpp 與 PyTorch 保留未用的空間；GB10 llama 後端約 4.3 GB，跑過長音訊後約 4.9 GB 並停在那裡）、`streaming`、`vad_loaded`、`active_streams`，正常時 `status` 為 `ok`、載入中為 `loading`。
 
 ### `app/main.py` 的串流協議細節 (`WS /asr_stream_api_v1`)
 以下是 `app/main.py`（容器／GB10 部署，預設 `:8803`）的行為；`server.py` 用同一協議，差異列在最後。

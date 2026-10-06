@@ -82,14 +82,16 @@ class R2T2LlamaModel(R2T2ASRModel):
 
     @classmethod
     def load(cls, model_dir: str, decoder_gguf: str, projector_gguf: str, native_cls) -> "R2T2LlamaModel":
-        base = R2T2ASRModel.from_pretrained(model_dir, device_map="cuda", dtype=torch.bfloat16)
+        # 文字解碼交給 llama.cpp，PyTorch 這邊只留聲學編碼器。先在 CPU 載入、刪掉解碼器
+        # 再搬上 GPU：直接載進 GPU 再刪，編碼器權重夾在那些大區段裡，empty_cache 還不回去，
+        # 會白佔約 2.6 GB（GB10 實測 6.9 GB → 4.3 GB）。
+        base = R2T2ASRModel.from_pretrained(model_dir, device_map="cpu", dtype=torch.bfloat16)
         thinker = getattr(base.model, "thinker", base.model)
-        # 文字解碼交給 llama.cpp，PyTorch 這邊只留聲學編碼器，省下約 3 GB 顯存。
         if hasattr(thinker, "model"):
             del thinker.model
         if hasattr(thinker, "lm_head"):
             del thinker.lm_head
-        torch.cuda.empty_cache()
+        base.model.to("cuda")
 
         self = cls(
             backend="llama",
