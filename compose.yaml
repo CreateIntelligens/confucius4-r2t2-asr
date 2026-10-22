@@ -2,7 +2,7 @@ services:
   # 宿主的模型目錄不存在時，Docker 會以 root 建立它，服務以宿主帳號執行就寫不進去，
   # 自動下載會失敗。這裡只把「root 擁有」的掛載點交給宿主帳號；本來就有主人的目錄不動。
   r2t2-init:
-    image: nginx:1.27-alpine
+    image: nginx:1.31.7-alpine
     restart: "no"
     user: "0:0"
     environment:
@@ -79,7 +79,7 @@ services:
       start_period: 600s
 
   r2t2-nginx:
-    image: nginx:1.27-alpine
+    image: nginx:1.31.7-alpine
     container_name: r2t2-nginx
     restart: unless-stopped
     depends_on:
