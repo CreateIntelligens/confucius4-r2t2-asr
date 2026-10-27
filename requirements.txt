@@ -18,11 +18,18 @@ accelerate
 librosa==0.11.0
 soundfile==0.14.0
 soxr
-fastapi==0.118.0
+fastapi==0.142.2
 uvicorn[standard]==0.37.0
-python-multipart==0.0.20
+python-multipart==0.0.32
 fireredvad==0.0.2
 opencc-python-reimplemented>=0.1.7
 # qwen_asr 的 forced aligner 在匯入時就需要，即使服務沒用到對齊功能
 nagisa
 soynlp
+
+# 2026-10 安全下限：starlette 0.48 有 High 漏洞，修正版在 1.x（fastapi 0.118 擋在 0.49 以下，所以一併升 fastapi）；
+# certifi 換掉被撤銷的 emSign 中繼憑證；venv 內建的 setuptools 59.6 有 High 漏洞，82 起移除 pkg_resources 所以設上限。
+starlette==1.7.0
+certifi>=2026.10.23
+urllib3>=2.8.0
+setuptools>=78.1.1,<82
