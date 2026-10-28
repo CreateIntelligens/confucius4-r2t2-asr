@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
@@ -38,7 +39,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import TransformersKwargs, check_model_inputs
+from transformers.utils.generic import TransformersKwargs, merge_with_config_defaults
+from transformers.utils.output_capturing import capture_outputs
 
 from .configuration_qwen3_asr import (
     Qwen3ASRAudioEncoderConfig,
@@ -293,6 +295,17 @@ class Qwen3ASRPreTrainedModel(PreTrainedModel):
     _can_record_outputs = {
         "attentions": Qwen3ASRTextAttention,
     }
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, SinusoidsPositionEmbedding):
+            log_timescale_increment = np.log(module.max_timescale) / (module.channels // 2 - 1)
+            inv_timescales = torch.exp(-log_timescale_increment * torch.arange(module.channels // 2).float())
+            scaled_time = torch.arange(module.length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
+            init.copy_(module.positional_embedding, torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1))
+        elif isinstance(module, Qwen3ASRThinkerTextRotaryEmbedding):
+            inv_freq, _ = module.rope_init_fn(module.config)
+            init.copy_(module.inv_freq, inv_freq)
 
 
 @dataclass
@@ -581,6 +594,11 @@ class SinusoidsPositionEmbedding(nn.Module):
         super().__init__()
         if channels % 2 != 0:
             raise ValueError("SinusoidsPositionEmbedding needs even channels input")
+        # 記下參數給 _init_weights 重算：transformers 5 先在 meta device 建模型，
+        # 不在 checkpoint 裡的 buffer 必須在那裡重新填值
+        self.length = length
+        self.channels = channels
+        self.max_timescale = max_timescale
         log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
         inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2).float())
         scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
@@ -783,21 +801,33 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
 
     def __init__(self, config: Qwen3ASRConfig, device=None):
         super().__init__()
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", "default")
-        else:
-            self.rope_type = "default"
+        # transformers 5 把 rope_theta／rope_scaling 收進 rope_parameters
+        rope = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+        self.rope_type = rope.get("rope_type", "default")
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        # transformers 5 的 ROPE_INIT_FUNCTIONS 不再含 "default"，要自己算
+        self.rope_init_fn = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
-        self.mrope_section = config.rope_scaling.get("mrope_section", [24, 20, 20])
+        self.mrope_section = rope.get("mrope_section", [24, 20, 20])
+
+    @staticmethod
+    def compute_default_rope_parameters(config, device=None, seq_len=None):
+        rope = getattr(config, "rope_parameters", None) or {}
+        base = rope.get("rope_theta", getattr(config, "rope_theta", None))
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, 1.0
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
         """Apply interleaved MRoPE to 3D rotary embeddings.
@@ -983,7 +1013,8 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
+    @merge_with_config_defaults
+    @capture_outputs
     @auto_docstring
     def forward(
         self,
@@ -993,7 +1024,6 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[tuple, BaseModelOutputWithPast]:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1006,15 +1036,12 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-
         # the hard coded `3` is for temporal, height and width.
+        # transformers 5 拿掉了 cache_position，位置改由快取裡已有的長度推算
         if position_ids is None:
-            position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
@@ -1026,9 +1053,8 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
 
         attention_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
@@ -1045,7 +1071,6 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
                 attention_mask=attention_mask,
                 position_ids=text_position_ids,
                 past_key_values=past_key_values,
-                cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
@@ -1067,7 +1092,8 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
 class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditionalGeneration, GenerationMixin):
     config: Qwen3ASRThinkerConfig
     base_model_prefix = "thinker"
-    _tied_weights_keys = ["model.embed_tokens.weight", "lm_head.weight"]
+    # transformers 5 改成 {目標: 來源} 的格式，舊的 list 寫法會讓 lm_head 被隨機初始化
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _no_split_modules = [
         "Qwen3ASRAudioEncoderLayer",
         "Qwen3ASRThinkerTextDecoderLayer",
@@ -1169,7 +1195,6 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         rope_deltas=None,
         labels=None,
         use_cache=None,
-        cache_position=None,
         **kwargs,
     ) -> Union[tuple, Qwen3ASRThinkerCausalLMOutputWithPast]:
         r"""
@@ -1208,11 +1233,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             audio_feature_lengths = None
 
         if attention_mask is not None and position_ids is None:
-            if (
-                cache_position is None
-                or (cache_position is not None and cache_position[0] == 0)
-                or self.rope_deltas is None
-            ):
+            # transformers 5 拿掉了 cache_position，改用快取裡已有的長度判斷 prefill 與解碼位置
+            past_key_values_length = 0 if past_key_values is None else past_key_values.get_seq_length()
+            if past_key_values_length == 0 or self.rope_deltas is None:
                 delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
                 position_ids, rope_deltas = self.get_rope_index(
                     attention_mask,
@@ -1221,7 +1244,7 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                 self.rope_deltas = rope_deltas
             else:
                 batch_size, seq_length = input_ids.shape
-                delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
+                delta = (past_key_values_length + self.rope_deltas).to(input_ids.device)
                 position_ids = torch.arange(seq_length, device=input_ids.device)
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
                 position_ids = position_ids.add(delta)
@@ -1233,7 +1256,6 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -1261,29 +1283,30 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
         past_key_values=None,
         attention_mask=None,
         inputs_embeds=None,
-        cache_position=None,
         position_ids=None,
         use_cache=True,
         input_features=None,
         feature_attention_mask=None,
+        is_first_iteration=False,
         **kwargs,
     ):
+        # transformers 5 不再傳 cache_position，改用 is_first_iteration 判斷是否為 prefill
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             position_ids=position_ids,
             use_cache=use_cache,
             input_features=input_features,
             feature_attention_mask=feature_attention_mask,
+            is_first_iteration=is_first_iteration,
             **kwargs,
         )
 
         model_inputs["position_ids"] = None
 
-        if cache_position[0] != 0:
+        if not is_first_iteration and use_cache:
             model_inputs["input_features"] = None
 
         return model_inputs

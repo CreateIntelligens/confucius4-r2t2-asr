@@ -101,8 +101,7 @@ class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
         downsample_hidden_size=480,
         **kwargs,
     ):
-        super().__init__(**kwargs)
-
+        # transformers 5 的 PreTrainedConfig.__init__ 會讀子類別屬性，要先設好再呼叫
         self.num_mel_bins = num_mel_bins
         self.d_model = d_model
         self.encoder_layers = encoder_layers
@@ -121,6 +120,7 @@ class Qwen3ASRAudioEncoderConfig(PretrainedConfig):
         self.n_window_infer = n_window_infer
         self.conv_chunksize = conv_chunksize
         self.downsample_hidden_size = downsample_hidden_size
+        super().__init__(**kwargs)
 
 
 class Qwen3ASRTextConfig(PretrainedConfig):
@@ -274,6 +274,8 @@ class Qwen3ASRTextConfig(PretrainedConfig):
         if self.rope_scaling is not None and "type" in self.rope_scaling:
             self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
+        # transformers 5 的基底設定不再預設帶 token id，模型會讀 pad_token_id
+        self.pad_token_id = kwargs.pop("pad_token_id", None)
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
@@ -336,7 +338,6 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
         initializer_range=0.02,
         **kwargs,
     ):
-        super().__init__(**kwargs)
         self.user_token_id = user_token_id
         self.audio_start_token_id = audio_start_token_id
         self.initializer_range = initializer_range
@@ -353,6 +354,11 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
             text_config = Qwen3ASRTextConfig()
         self.text_config = text_config
         self.audio_token_id = audio_token_id
+        self.pad_token_id = kwargs.pop("pad_token_id", None)
+        # transformers 5 依子模型自己的 config 決定 lm_head 是否共用 embedding；
+        # checkpoint 沒有 lm_head 權重，要跟 text_config 一致，否則 lm_head 會被隨機初始化
+        tie_word_embeddings = kwargs.pop("tie_word_embeddings", text_config.tie_word_embeddings)
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
 class Qwen3ASRConfig(PretrainedConfig):
@@ -400,12 +406,15 @@ class Qwen3ASRConfig(PretrainedConfig):
         support_languages=None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
         if thinker_config is None:
             thinker_config = {}
+        # transformers 5 載入時可能已經把子設定建成物件
+        if isinstance(thinker_config, dict):
+            thinker_config = Qwen3ASRThinkerConfig(**thinker_config)
 
-        self.thinker_config = Qwen3ASRThinkerConfig(**thinker_config)
+        self.thinker_config = thinker_config
         self.support_languages = support_languages
+        super().__init__(**kwargs)
 
     def get_text_config(self, decoder=False) -> "PretrainedConfig":
         """
