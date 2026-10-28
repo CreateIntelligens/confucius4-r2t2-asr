@@ -20,6 +20,15 @@ Versions are categorized by date (`YYYY-MM-DD`).
 - **`app/main.py` 支援繁體輸出與停止上傳辨識**：`output_script`（串流 header 與兩個上傳端點）、`POST /transcribe/cancel` 與 `start` 事件的 `job_id`，與 `server.py` 相同。串流的繁體轉換以整句累積文字進行，被拆在兩則訊息裡的詞仍會轉成台灣慣用語；`final_text` 以整句轉換。
 
 ### Changed
+- **transformers 4.57.6 → 5.10.1**：4.x 線的 CVE-2026-4372、1839、5241、9856、80047 只在 5.x 修好。內嵌的 Qwen3-ASR（`app/qwen_asr/core/transformers_backend/`）照 transformers 5 的介面改寫：
+  - `check_model_inputs` 改成 `merge_with_config_defaults` 加 `capture_outputs`
+  - config 先設屬性再呼叫 `super().__init__()`
+  - rope 參數改讀 `rope_parameters`，`default` 型自己算 inv_freq
+  - `_tied_weights_keys` 改成 dict，Thinker config 跟著 text config 共用 lm_head
+  - 拿掉 `cache_position`，改用快取長度與 `is_first_iteration`
+  - 在 `_init_weights` 重算音訊編碼器的正弦位置編碼。transformers 5 先在 meta device 建模型，沒重算的話這個 buffer 是錯的值，llama 與 Transformers 後端都只會輸出亂碼
+
+  驗證：pytest 108 passed；VH-402 混語 200 個音檔，llama 後端與 Transformers 後端的輸出都和 4.57.6 逐字相同。
 - **`server.py` 改採 main 的推論排程器**（單一工作執行緒加雙佇列），不再維護 dev 自己的排隊鎖版本；只保留兩處差異：`zhen` 對應成 Chinese、建立串流狀態也交給工作執行緒。
 - **`app/main.py` 串流優先於上傳音檔**：有人在講話時，上傳最多每 `UPLOAD_MIN_INTERVAL_SECONDS`（預設 5 秒）跑一段，沒人講話時不受限制。按次數輪流（main 的每 6 步讓一段）在這裡不夠：上傳的一段是 30 秒音訊一次算完，實測三路串流仍會晚 1.5–5.5 秒。`/healthz` 的 `inference` 多了 `waiting_live`、`waiting_batch`。
 - **`app/main.py` 同時串流數上限** `MAX_CONCURRENT_STREAMS`（預設 12），超過時回錯誤訊息並以 1013 關閉，與 `server.py` 相同。
